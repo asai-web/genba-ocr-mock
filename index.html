@@ -1,0 +1,1664 @@
+<!DOCTYPE html>
+<html lang="ja">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>現場そろばん（建築現場OCR・Phase1モック）</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+<link href="https://fonts.googleapis.com/css2?family=Noto+Sans+JP:wght@400;500;700;900&display=swap" rel="stylesheet">
+<script src="https://cdn.tailwindcss.com"></script>
+<script src="https://unpkg.com/react@18/umd/react.production.min.js"></script>
+<script src="https://unpkg.com/react-dom@18/umd/react-dom.production.min.js"></script>
+<script src="https://unpkg.com/@babel/standalone/babel.min.js"></script>
+<script>
+  tailwind.config = {
+    theme: {
+      extend: {
+        colors: {
+          brand: { 50:"#fff7ed",100:"#ffedd5",200:"#fed7aa",300:"#fdba74",400:"#fb923c",500:"#f97316",600:"#ea580c",700:"#c2410c",800:"#9a3412",900:"#7c2d12" },
+          ink:   { 50:"#f6f7f9",100:"#eceef1",200:"#dfe3e8",300:"#c6ccd4",400:"#98a1ad",500:"#68727e",600:"#4a535e",700:"#343b44",800:"#20252b",900:"#12161a" }
+        }
+      }
+    }
+  }
+</script>
+<style>
+  body { font-family:"Noto Sans JP",-apple-system,BlinkMacSystemFont,"Segoe UI","Hiragino Sans","Yu Gothic UI","Meiryo",sans-serif; -webkit-font-smoothing:antialiased; }
+  .num { font-variant-numeric: tabular-nums; }
+  .scroll-thin::-webkit-scrollbar { width:0; height:0; }
+  .field { background:#fff; border:1px solid #dfe3e8; border-radius:10px; padding:11px 12px; font-size:15px; width:100%; }
+  .field:focus { outline:none; border-color:#f97316; box-shadow:0 0 0 3px rgba(249,115,22,.16); }
+  .label { font-size:12px; color:#68727e; font-weight:700; letter-spacing:.02em; }
+  .chip { display:inline-flex; align-items:center; gap:4px; padding:3px 9px; border-radius:9999px; font-size:11px; font-weight:700; }
+  .card { background:#fff; border:1px solid #e6e9ee; border-radius:16px; }
+  .ph-img { background:linear-gradient(135deg,#e2e5eb 25%,#f2f4f7 25%,#f2f4f7 50%,#e2e5eb 50%,#e2e5eb 75%,#f2f4f7 75%); background-size:14px 14px; }
+  .gloss { background:#fff7ed; border-left:3px solid #f97316; padding:9px 12px; font-size:12px; color:#7c2d12; border-radius:0 8px 8px 0; }
+  .impl  { background:#f6f7f9; border-left:3px solid #4a535e; padding:10px 13px; font-size:12.5px; color:#20252b; border-radius:0 8px 8px 0; line-height:1.7; }
+  details>summary{list-style:none;cursor:pointer}
+  details>summary::-webkit-details-marker{display:none}
+  @keyframes spin{to{transform:rotate(360deg)}}
+  .spin{animation:spin 1s linear infinite}
+  @keyframes fadeup{from{opacity:0;transform:translateY(8px)}to{opacity:1;transform:none}}
+  .fadeup{animation:fadeup .22s ease}
+  @keyframes rowin{from{opacity:0;transform:translateX(-10px)}to{opacity:1;transform:none}}
+  .rowin{animation:rowin .34s cubic-bezier(.2,.7,.3,1) both}
+  @keyframes snap{0%{background:#fdba74}60%{background:#ffedd5}100%{background:transparent}}
+  .snap{animation:snap .9s ease both}
+  .tap:active{transform:scale(.97)}
+</style>
+</head>
+<body class="bg-ink-200 text-ink-800">
+<div id="root"></div>
+
+<script type="text/babel" data-presets="react">
+const { useState, useMemo, useRef } = React;
+
+/* ============================== ユーティリティ ============================== */
+const TODAY = "2026-07-06";
+const yen = (n) => "¥" + (Number(n)||0).toLocaleString("ja-JP");
+const man = (n) => (Math.round((Number(n)||0)/1000)/10).toLocaleString("ja-JP") + "万";
+
+/* 書類種別（自動判定の対象） */
+const DOCTYPE = {
+  invoice:  { key:"invoice",  label:"請求書", icon:"📄" },
+  delivery: { key:"delivery", label:"納品書", icon:"📦" },
+  order:    { key:"order",    label:"発注書", icon:"📝" },
+  receipt:  { key:"receipt",  label:"領収書", icon:"🧾" },
+};
+/* 区分：原価（仕入）か 売上（自社請求）か —— 粗利はこの2区分だけで出る */
+const DIR = {
+  cost:  { key:"cost",  label:"原価（仕入）", cls:"bg-rose-50 text-rose-700 border border-rose-200" },
+  sales: { key:"sales", label:"売上（請求）", cls:"bg-emerald-50 text-emerald-700 border border-emerald-200" },
+};
+
+/* スキャン結果の明細を現場ごとに集計（実額積み上げ）。明細が無ければ書類全体を1件扱い */
+const allocationsOf = (r)=>{
+  const items = (r.items&&r.items.length) ? r.items : [{ name:"", amount:r.total, pid:r.pid_hint }];
+  const g={};
+  items.forEach(it=>{ const k=it.pid||""; (g[k]=g[k]||{amount:0,names:[]}); g[k].amount+=(it.amount||0); g[k].names.push(it.name); });
+  return Object.entries(g).map(([pid,x])=>({ pid, amount:x.amount, memo:x.names.filter(Boolean)[0]||"" }));
+};
+/* 未確認トレイで「見ずにそのまま確定してよい」書類か（全明細に現場あり・全明細読取済み・未登録現場なし・明細合計＝原本合計） */
+const isReady = (r)=>{
+  if(!r || r.fail || r.project_new || !(r.total>0)) return false;
+  const items = (r.items&&r.items.length) ? r.items : [{ amount:r.total, pid:r.pid_hint }];
+  const allAssigned = items.every(it=> !!it.pid);
+  const allRead = items.every(it=> it.amount!=null && !it.unread);
+  const sum = items.reduce((s,it)=>s+(it.amount||0),0);
+  return allAssigned && allRead && sum===r.total;
+};
+/* 重複判定キー（取引先＋日付＋原本合計） */
+const dupKey = (d)=> (d.partner||"").trim()+"|"+d.date+"|"+(d.src!=null?d.src:d.total);
+
+/* ============================== サンプルデータ ============================== */
+const seedProjects = [
+  { id:"P1", name:"大和ハウス様 A邸 新築", client:"大和ハウス工業", sales:4800000 },
+  { id:"P2", name:"市営 中央町 外構工事",   client:"○○市 建設課",   sales:2600000 },
+  { id:"P3", name:"佐藤ビル 改修工事",       client:"佐藤不動産",     sales:1350000 },
+];
+const seedDocs = [
+  { id:"D1", pid:"P1", type:"invoice",  dir:"cost",  partner:"東海建材センター", date:"2026-06-28", total:286000, memo:"生コン・鉄筋" },
+  { id:"D2", pid:"P1", type:"delivery", dir:"cost",  partner:"中部鋼材",         date:"2026-06-25", total:154000, memo:"H鋼 6本" },
+  { id:"D3", pid:"P1", type:"invoice",  dir:"cost",  partner:"みなと電設",       date:"2026-06-30", total:198000, memo:"電気工事 外注" },
+  { id:"D4", pid:"P1", type:"invoice",  dir:"sales", partner:"大和ハウス工業",   date:"2026-06-30", total:2400000, memo:"第1回 出来高請求" },
+  { id:"D5", pid:"P2", type:"order",    dir:"cost",  partner:"グリーン緑化",     date:"2026-06-20", total:420000, memo:"植栽・芝" },
+  { id:"D6", pid:"P2", type:"invoice",  dir:"cost",  partner:"東海建材センター", date:"2026-06-27", total:180000, memo:"インターロッキング" },
+];
+
+/* 撮影に使うダミー書類（選ぶとVision APIの返却を模擬） */
+const sampleShots = [
+  { id:"s1", tint:"from-orange-100 to-amber-50", face:"請求書",  conf:0.97,
+    result:{ type:"invoice", dir:"cost", partner:"東海建材センター", date:"2026-07-05", total:238000, no:"INV-2026-0712",
+      items:[{name:"普通生コン 24-18-20",amount:198000,pid:"P1"},{name:"異形鉄筋 D13",amount:40000,pid:"P1"}], pid_hint:"P1" } },
+  { id:"s2", tint:"from-sky-100 to-blue-50", face:"納品書", conf:0.94,
+    result:{ type:"delivery", dir:"cost", partner:"中部鋼材", date:"2026-07-04", total:140000, no:"納-3391",
+      items:[{name:"H形鋼 200×100",amount:138000,pid:"P1"},{name:"運搬費",amount:2000,pid:"P1"}], pid_hint:"P1" } },
+  { id:"s3", tint:"from-emerald-100 to-teal-50", face:"請求書(自社)", conf:0.9,
+    result:{ type:"invoice", dir:"sales", partner:"佐藤不動産", date:"2026-07-06", total:1227272, no:"請2026-041",
+      items:[{name:"改修工事一式（第2回）",amount:1227272,pid:"P3"}], pid_hint:"P3" } },
+  { id:"s4", tint:"from-violet-100 to-fuchsia-50", face:"領収書", conf:0.82,
+    result:{ type:"receipt", dir:"cost", partner:"コメリ 現場前店", date:"2026-07-06", total:8909, no:"—",
+      items:[{name:"消耗品（軍手・ビス他）",amount:8909,pid:"P2"}], pid_hint:"P2" } },
+  { id:"s5", tint:"from-amber-100 to-yellow-50", face:"複数現場 請求書", conf:0.86,
+    result:{ type:"invoice", dir:"cost", partner:"東海建材センター", date:"2026-07-06", total:320000, no:"INV-2026-0733",
+      items:[
+        {name:"生コン 24-18-20", amount:132000, siteRaw:"A邸"},
+        {name:"型枠合板", amount:54000, siteRaw:"A邸"},
+        {name:"CBブロック", amount:56000, siteRaw:"中央町 外構"},
+        {name:"インターロッキング一式", amount:78000, siteRaw:"中央町 外構"},
+      ], multi:true } },
+  { id:"s6", tint:"from-ink-300 to-ink-200", face:"読み取り不良", conf:0.18,
+    result:{ fail:true } },
+  { id:"s7", tint:"from-rose-100 to-amber-50", face:"新規現場 要確認", conf:0.52,
+    result:{ type:"invoice", dir:"cost", partner:"山田工務店", date:"2026-07-06", total:0, no:"",
+      items:[], project_new:"山田邸 増築工事", pid_hint:null } },
+  { id:"s8", tint:"from-fuchsia-100 to-rose-50", face:"複数現場 要確認", conf:0.6,
+    result:{ type:"invoice", dir:"cost", partner:"中部建材", date:"2026-07-07", total:300000, no:"INV-2026-0740",
+      items:[
+        {name:"生コン", amount:120000, siteRaw:"A邸"},
+        {name:"異形鉄筋", amount:80000, siteRaw:"中央町 外構"},
+        {name:"（読取不可）", amount:null, unread:true, siteRaw:"A邸"},
+        {name:"型枠材", amount:40000, siteRaw:""},
+      ], multi:true } },
+  { id:"r1", tint:"from-sky-100 to-cyan-50", face:"作業日報", conf:0.82,
+    result:{ kind:"report", siteRaw:"A邸", date:"2026-07-15", weather:"☀️晴", workers:["佐藤","鈴木","田中"], start:"08:00", end:"17:00",
+      work:"2階床の下地組み、断熱材充填。午後に石膏ボード搬入。", materials:"石膏ボード、断熱材" } },
+  { id:"r2", tint:"from-blue-100 to-sky-50", face:"作業日報 手書き", conf:0.55,
+    result:{ kind:"report", siteRaw:"青葉台ハイツ 新築", date:"2026-07-15", weather:"⛅曇", workers:["山本","高橋"], start:"08:30", end:"16:30",
+      work:"", workUnread:true, materials:"" } },
+  { id:"s9", tint:"from-orange-100 to-rose-50", face:"月次まとめ請求書 13行", conf:0.8,
+    result:{ type:"invoice", dir:"cost", partner:"東海建材センター", date:"2026-07-31", total:495000, no:"INV-2026-0799",
+      items:[
+        {name:"普通生コン 24-18-20", amount:132000, siteRaw:"A邸"},                 /* 既存名寄せ */
+        {name:"異形鉄筋 D13",        amount:48000,  siteRaw:"A邸"},
+        {name:"型枠合板 12mm",       amount:54000,  siteRaw:"A邸"},
+        {name:"",                    amount:12000,  siteRaw:"A邸"},                 /* 品名 読取不可 */
+        {name:"CBブロック",           amount:56000,  siteRaw:"中央町 外構"},         /* 別の既存名寄せ */
+        {name:"インターロッキング",   amount:78000,  siteRaw:"中央町 外構"},
+        {name:"防草シート",           amount:22000,  siteRaw:"青葉台ハイツ 新築"},   /* 新規→自動登録 */
+        {name:"アンカーボルト",       amount:null, unread:true, siteRaw:"青葉台ハイツ 新築"}, /* 金額 読取不可 */
+        {name:"コーキング材",         amount:9000,   siteRaw:"本町ビル 改修"},       /* 新規→自動登録2 */
+        {name:"外部塗料",             amount:36000,  siteRaw:"本町ビル 改修"},
+        {name:"電線管",               amount:18000,  siteRaw:"佐藤ビル"},           /* 既存名寄せ3 */
+        {name:"運搬費",               amount:6000,   siteRaw:""},                   /* 現場なし→要命名 */
+        {name:"",                    amount:null, unread:true, siteRaw:""},        /* 品名・金額・現場 全て不可 */
+      ], multi:true } },
+];
+
+/* まとめてスキャン（デモ）：明細の現場名から案件マスタを自動生成する束 */
+const demoBatch = [
+  { partner:"青葉建材",   date:"2026-07-02", type:"invoice",  dir:"cost", lines:[
+    {name:"生コン 24-18", amount:186000, site:"青葉台 T様邸 新築"},
+    {name:"異形鉄筋",     amount:64000,  site:"青葉台 T様邸 新築"} ]},
+  { partner:"みどり電設", date:"2026-07-03", type:"invoice",  dir:"cost", lines:[
+    {name:"電気配線工事", amount:148000, site:"本町マンション 改修"} ]},
+  { partner:"青葉建材",   date:"2026-07-04", type:"delivery", dir:"cost", lines:[
+    {name:"型枠合板",     amount:72000,  site:"駅前ビル 新築"},
+    {name:"金物一式",     amount:31000,  site:"青葉台 T様邸 新築"} ]},
+  { partner:"サカイ塗装", date:"2026-07-05", type:"invoice",  dir:"cost", lines:[
+    {name:"外壁塗装",     amount:224000, site:"本町マンション 改修"} ]},
+  { partner:"関東生コン", date:"2026-07-06", type:"invoice",  dir:"cost", lines:[
+    {name:"生コン 21-18", amount:98000,  site:"駅前ビル 新築"} ]},
+];
+
+/* ============================== 日報データ ============================== */
+const WEATHER = ["☀️晴","⛅曇","☔雨","❄️雪"];
+const seedReports = [
+  { id:"R1", pid:"P1", date:"2026-07-05", weather:"☀️晴", workers:["佐藤","鈴木","田中"], start:"08:30", end:"17:00",
+    work:"1階基礎の配筋・型枠建込。午後から生コン打設準備。", materials:"異形鉄筋D13、型枠合板", progress:35, note:"クレーン搬入時の合図・立入禁止を徹底。" },
+  { id:"R2", pid:"P2", date:"2026-07-05", weather:"⛅曇", workers:["山本","高橋"], start:"09:00", end:"16:00",
+    work:"外構ブロック積み2段目まで完了。", materials:"CBブロック、モルタル", progress:60, note:"" },
+];
+
+/* 音声→AI下書きの再現用（本番はマイク録音→文字起こし→整形） */
+const voiceSample = {
+  transcript:"今日はA邸の基礎配筋、佐藤・鈴木・田中の3人で朝8時半から夕方5時まで。天気は晴れ。生コン10立米搬入して打設準備までやった。",
+  result:{ pid:"P1", date:TODAY, weather:"☀️晴", workers:["佐藤","鈴木","田中"], start:"08:30", end:"17:00",
+    work:"基礎配筋を実施。生コン10m³を搬入し、打設準備まで完了。", materials:"生コン10m³、異形鉄筋", progress:40, note:"" },
+};
+
+/* ============================== 集計 ============================== */
+function useAgg(projects, docs){
+  return useMemo(()=>projects.map(p=>{
+    const ds = docs.filter(d=>d.pid===p.id);
+    const cost  = ds.filter(d=>d.dir==="cost").reduce((s,d)=>s+d.total,0);
+    const sales = ds.filter(d=>d.dir==="sales").reduce((s,d)=>s+d.total,0) || p.sales;
+    const profit = sales - cost;
+    const rate = sales? Math.round(profit/sales*100):0;
+    return { ...p, cost, sales, profit, rate, count:ds.length };
+  }),[projects,docs]);
+}
+
+/* ============================== 小物 ============================== */
+const Header = ({title, sub, onBack, right}) => (
+  <div className="sticky top-0 z-20 bg-white/95 backdrop-blur border-b border-ink-200 px-4 pt-3 pb-3 flex items-center gap-3">
+    {onBack && <button onClick={onBack} className="tap w-9 h-9 -ml-1 rounded-full hover:bg-ink-100 flex items-center justify-center text-xl text-ink-600">‹</button>}
+    <div className="flex-1 min-w-0">
+      <div className="font-black text-[17px] text-ink-900 truncate">{title}</div>
+      {sub && <div className="text-[11px] text-ink-500 -mt-0.5">{sub}</div>}
+    </div>
+    {right}
+  </div>
+);
+const Toast = ({msg}) => msg ? (
+  <div className="fixed left-1/2 -translate-x-1/2 bottom-24 z-50 bg-ink-900 text-white text-[13px] font-bold px-4 py-2.5 rounded-full shadow-lg fadeup">{msg}</div>
+) : null;
+
+/* ============================== 月次・日次 収支表 ============================== */
+const monthLabel = (m)=> m ? m.slice(0,4)+"年"+(+m.slice(5,7))+"月" : "";
+function MonthlyView({docs, onExport}){
+  const months = useMemo(()=>{ const s={}; docs.forEach(d=>s[d.date.slice(0,7)]=1); return Object.keys(s).sort().reverse(); },[docs]);
+  const [mi,setMi] = useState(0);
+  const month = months[mi] || "";
+  const md = docs.filter(d=>d.date.slice(0,7)===month);
+  const byDay = {};
+  md.forEach(d=>{ byDay[d.date]=byDay[d.date]||{date:d.date,sales:0,cost:0}; byDay[d.date][d.dir]+=d.total; });
+  const days = Object.values(byDay).sort((a,b)=>a.date.localeCompare(b.date));
+  const tSales = md.filter(d=>d.dir==="sales").reduce((s,d)=>s+d.total,0);
+  const tCost  = md.filter(d=>d.dir==="cost").reduce((s,d)=>s+d.total,0);
+  const tProfit = tSales - tCost;
+  const rate = tSales? Math.round(tProfit/tSales*100):0;
+  const doExport=(kind)=>{
+    const header=["日付","売上","原価","粗利"];
+    const rows=days.map(d=>[d.date, d.sales, d.cost, d.sales-d.cost]);
+    rows.push(["合計", tSales, tCost, tProfit]);
+    onExport({ kind, title:`${monthLabel(month)} 月次収支`, matrix:[header,...rows] });
+  };
+  return (
+    <div className="px-4 pt-4">
+      {/* 月セレクタ */}
+      <div className="flex items-center justify-between card p-2">
+        <button onClick={()=>setMi(i=>Math.min(months.length-1,i+1))} disabled={mi>=months.length-1}
+          className="tap w-10 h-9 rounded-lg hover:bg-ink-100 text-ink-600 text-lg disabled:opacity-30">‹</button>
+        <div className="font-black text-ink-900">{monthLabel(month)}</div>
+        <button onClick={()=>setMi(i=>Math.max(0,i-1))} disabled={mi<=0}
+          className="tap w-10 h-9 rounded-lg hover:bg-ink-100 text-ink-600 text-lg disabled:opacity-30">›</button>
+      </div>
+
+      {/* 月次サマリー */}
+      <div className="rounded-2xl bg-gradient-to-br from-ink-900 to-ink-700 text-white p-4 mt-3">
+        <div className="text-[11px] text-ink-300 font-bold">{monthLabel(month)}の粗利</div>
+        <div className={"text-3xl font-black num mt-0.5 "+(tProfit<0?"text-rose-300":"")}>{yen(tProfit)}</div>
+        <div className="flex gap-4 mt-3 text-[12px]">
+          <div><span className="text-ink-400">売上 </span><span className="num font-bold">{man(tSales)}</span></div>
+          <div><span className="text-ink-400">原価 </span><span className="num font-bold text-brand-300">{man(tCost)}</span></div>
+          <div><span className="text-ink-400">粗利率 </span><span className="num font-bold">{rate}%</span></div>
+        </div>
+      </div>
+
+      {/* 日次収支表 */}
+      <div className="label mt-4 mb-2 px-1">日次の収支</div>
+      <div className="card overflow-hidden">
+        <div className="overflow-x-auto scroll-thin">
+          <table className="w-full text-[12px]">
+            <thead>
+              <tr className="bg-ink-50 text-ink-500">
+                <th className="text-left font-bold px-3 py-2 whitespace-nowrap">日付</th>
+                <th className="text-right font-bold px-2 py-2 whitespace-nowrap">売上</th>
+                <th className="text-right font-bold px-2 py-2 whitespace-nowrap">原価</th>
+                <th className="text-right font-bold px-3 py-2 whitespace-nowrap">粗利</th>
+              </tr>
+            </thead>
+            <tbody>
+              {days.map(d=>{ const pr=d.sales-d.cost; return (
+                <tr key={d.date} className="border-t border-ink-100">
+                  <td className="px-3 py-2 num whitespace-nowrap">{(+d.date.slice(5,7))+"/"+(+d.date.slice(8,10))}</td>
+                  <td className="px-2 py-2 num text-right whitespace-nowrap">{d.sales?yen(d.sales):"–"}</td>
+                  <td className="px-2 py-2 num text-right text-rose-600 whitespace-nowrap">{d.cost?yen(d.cost):"–"}</td>
+                  <td className={"px-3 py-2 num text-right font-bold whitespace-nowrap "+(pr>=0?"text-emerald-600":"text-rose-600")}>{yen(pr)}</td>
+                </tr>);})}
+              {!days.length && <tr><td colSpan="4" className="text-center text-ink-400 py-8">この月の書類はありません</td></tr>}
+            </tbody>
+            {days.length>0 && (
+              <tfoot>
+                <tr className="border-t-2 border-ink-200 bg-ink-50 font-black">
+                  <td className="px-3 py-2.5 whitespace-nowrap">合計</td>
+                  <td className="px-2 py-2.5 num text-right whitespace-nowrap">{yen(tSales)}</td>
+                  <td className="px-2 py-2.5 num text-right text-rose-600 whitespace-nowrap">{yen(tCost)}</td>
+                  <td className="px-3 py-2.5 num text-right text-emerald-700 whitespace-nowrap">{yen(tProfit)}</td>
+                </tr>
+              </tfoot>
+            )}
+          </table>
+        </div>
+      </div>
+
+      {/* 出力 */}
+      <div className="flex gap-2 mt-4">
+        <button onClick={()=>doExport("csv")} disabled={!days.length} className="tap flex-1 py-3 rounded-xl bg-ink-900 text-white font-bold text-[13px] disabled:opacity-40">CSV出力</button>
+        <button onClick={()=>doExport("excel")} disabled={!days.length} className="tap flex-1 py-3 rounded-xl bg-white border border-ink-200 text-ink-700 font-bold text-[13px] disabled:opacity-40">Excelにコピー</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== ホーム：現場ごとの利益（スマホ） ============================== */
+function Home({agg, onOpen, totals}){
+  return (
+    <div className="pb-24">
+      <Header title="現場そろばん" sub={`${TODAY} ・ ${agg.length}現場`} />
+      <div className="px-4 pt-4">
+        <div className="rounded-2xl bg-gradient-to-br from-ink-900 to-ink-700 text-white p-4">
+          <div className="text-[11px] text-ink-300 font-bold">進行中の粗利合計</div>
+          <div className="text-3xl font-black num mt-0.5">{yen(totals.profit)}</div>
+          <div className="flex gap-4 mt-3 text-[12px]">
+            <div><span className="text-ink-400">売上 </span><span className="num font-bold">{man(totals.sales)}</span></div>
+            <div><span className="text-ink-400">原価 </span><span className="num font-bold text-brand-300">{man(totals.cost)}</span></div>
+            <div><span className="text-ink-400">粗利率 </span><span className="num font-bold">{totals.rate}%</span></div>
+          </div>
+        </div>
+      </div>
+      <div className="px-4 pt-4 space-y-3">
+        <div className="label px-1">現場ごとの利益</div>
+        {agg.map(p=>(
+          <button key={p.id} onClick={()=>onOpen(p.id)} className="tap card w-full text-left p-4 active:bg-ink-50">
+            <div className="flex items-start justify-between gap-2">
+              <div className="min-w-0">
+                <div className="font-black text-ink-900 truncate">{p.name}</div>
+                <div className="text-[12px] text-ink-500 mt-0.5">{p.client}・書類{p.count}枚</div>
+              </div>
+              <span className={"chip "+(p.rate>=25?"bg-emerald-50 text-emerald-700 border border-emerald-200":p.rate>=10?"bg-amber-50 text-amber-700 border border-amber-200":"bg-rose-50 text-rose-700 border border-rose-200")}>粗利{p.rate}%</span>
+            </div>
+            <div className="mt-3 grid grid-cols-3 gap-2 text-center">
+              <div className="rounded-xl bg-ink-50 py-2"><div className="text-[10px] text-ink-500 font-bold">売上</div><div className="num font-bold text-[13px]">{man(p.sales)}</div></div>
+              <div className="rounded-xl bg-ink-50 py-2"><div className="text-[10px] text-ink-500 font-bold">原価</div><div className="num font-bold text-[13px] text-rose-600">{man(p.cost)}</div></div>
+              <div className="rounded-xl bg-brand-50 py-2"><div className="text-[10px] text-brand-700 font-bold">粗利</div><div className="num font-black text-[13px] text-brand-700">{man(p.profit)}</div></div>
+            </div>
+          </button>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 撮影 / 取込（連続スキャン＋未確認トレイ） ============================== */
+function Capture({onScanned, pending, onOpen, onBulkConfirm, projects}){
+  const [phase,setPhase] = useState("idle"); // idle | scanning
+  const [picked,setPicked] = useState(null);
+  const shoot = (shot)=>{ if(phase==="scanning")return; setPicked(shot); setPhase("scanning");
+    setTimeout(()=>{ onScanned(shot.result, shot.tint); setPhase("idle"); setPicked(null); }, 1500); };
+  const pname=(pid)=>(projects.find(p=>p.id===pid)||{}).name||"";
+  const readyCount = pending.filter(isReady).length;
+  return (
+    <div className="pb-28">
+      <Header title="書類を撮影" sub="続けて撮ってOK。あとでまとめて確認" />
+      <div className="px-4 pt-4">
+        {/* カメラビュー */}
+        <div className="relative rounded-2xl overflow-hidden bg-ink-900 aspect-[4/3] flex items-center justify-center">
+          {phase==="scanning" && picked ? (
+            <div className={"absolute inset-0 bg-gradient-to-br "+picked.tint+" flex items-center justify-center"}>
+              <div className="text-ink-400 text-6xl">{(DOCTYPE[picked.result.type]||{icon:"📄"}).icon}</div>
+              <div className="absolute left-0 right-0 h-1 bg-brand-400/80 shadow-[0_0_20px_6px_rgba(251,146,60,.6)]" style={{animation:"fadeup 1.2s ease-in-out infinite alternate", top:"30%"}}></div>
+              <div className="absolute bottom-0 inset-x-0 bg-black/60 text-white text-center py-3">
+                <span className="inline-block w-4 h-4 border-2 border-white/40 border-t-white rounded-full spin align-middle mr-2"></span>
+                <span className="font-bold text-[13px] align-middle">AIが解析中…</span>
+              </div>
+            </div>
+          ) : (
+            <>
+              <div className="absolute inset-6 border-2 border-dashed border-white/30 rounded-xl"></div>
+              <div className="text-center text-white/70">
+                <div className="text-5xl mb-2">📷</div>
+                <div className="text-[13px] font-bold">枠内に書類を入れて撮影</div>
+                <div className="text-[11px] text-white/50 mt-1">請求書・納品書・発注書・領収書に対応</div>
+              </div>
+            </>
+          )}
+        </div>
+        {/* 撮影ボタン */}
+        <button onClick={()=>shoot(sampleShots[0])} disabled={phase==="scanning"}
+          className="tap w-full mt-4 py-4 rounded-2xl bg-brand-500 text-white font-black text-[15px] shadow-lg shadow-brand-200 disabled:opacity-50">📷 スキャンする</button>
+        {/* サンプル選択 */}
+        <div className="mt-5">
+          <div className="text-[12px] text-ink-500 font-bold mb-2 px-1">サンプル書類でためす（続けてタップOK）</div>
+          <div className="grid grid-cols-4 gap-2">
+            {sampleShots.filter(s=>s.result.kind!=="report").map(s=>(
+              <button key={s.id} onClick={()=>shoot(s)} disabled={phase==="scanning"}
+                className={"tap rounded-xl aspect-[3/4] bg-gradient-to-br "+s.tint+" border border-ink-200 flex flex-col items-center justify-center gap-1 disabled:opacity-50"}>
+                <span className="text-2xl">{(DOCTYPE[s.result.type]||{icon:"⚠️"}).icon}</span>
+                <span className="text-[10px] font-bold text-ink-700 leading-tight text-center px-0.5">{s.face}</span>
+              </button>
+            ))}
+          </div>
+        </div>
+
+        {/* 未確認トレイ */}
+        {pending.length>0 && (
+          <div className="mt-6">
+            <div className="flex items-center justify-between mb-2 px-1">
+              <span className="text-[13px] font-black text-ink-800">未確認トレイ（{pending.length}）</span>
+              {readyCount>0 && <button onClick={onBulkConfirm} className="tap text-[12px] font-black text-brand-600">OKな{readyCount}件をまとめて保存</button>}
+            </div>
+            <div className="space-y-2">
+              {pending.map(it=>{
+                const ready=isReady(it);
+                return (
+                  <button key={it._id} onClick={()=>onOpen(it)} className="tap card w-full text-left p-3 flex items-center gap-3 active:bg-ink-50">
+                    <div className={"w-10 h-10 rounded-xl flex items-center justify-center text-lg bg-gradient-to-br "+(it._tint||"from-ink-100 to-ink-50")}>{(DOCTYPE[it.type]||{icon:"⚠️"}).icon}</div>
+                    <div className="flex-1 min-w-0">
+                      <div className="font-bold text-ink-900 truncate">{it.partner||"（取引先を確認）"}</div>
+                      <div className="text-[11px] text-ink-500 truncate">{it.total?yen(it.total):"金額を確認"}{it.pid_hint&&!it.project_new?"・"+pname(it.pid_hint):it.project_new?"・"+it.project_new+"(新規)":""}</div>
+                    </div>
+                    {ready
+                      ? <span className="chip bg-emerald-50 text-emerald-700 border border-emerald-200">OK</span>
+                      : <span className="chip bg-amber-100 text-amber-800 border border-amber-200">要確認</span>}
+                  </button>
+                );
+              })}
+            </div>
+            <div className="gloss mt-2">「OK」は現場も金額も確定済み。まとめて保存できます。「要確認」はタップして直してから保存。</div>
+          </div>
+        )}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 読み取り失敗 ============================== */
+function ReadFailed({onRetry, onManual}){
+  return (
+    <div className="pb-28">
+      <Header title="読み取り結果" onBack={onRetry} />
+      <div className="px-4 pt-8 text-center">
+        <div className="text-6xl mb-3">🔍</div>
+        <div className="font-black text-ink-900 text-lg">うまく読み取れませんでした</div>
+        <div className="text-[13px] text-ink-500 mt-2 leading-relaxed">ピンボケや影が原因かもしれません。<br/>もう一度撮るか、手で入力できます。</div>
+        <div className="card p-4 mt-6 text-left">
+          <div className="text-[12px] font-black text-ink-700 mb-2">📷 きれいに撮るコツ</div>
+          <ul className="text-[12.5px] text-ink-600 space-y-1.5">
+            <li>・書類全体が枠の中に入るように</li>
+            <li>・影が入らない明るい場所で</li>
+            <li>・ピントが合うまで少し待つ</li>
+          </ul>
+        </div>
+        <button onClick={onRetry} className="tap w-full mt-6 py-3.5 rounded-2xl bg-brand-500 text-white font-black shadow-lg shadow-brand-200">📷 撮り直す</button>
+        <button onClick={onManual} className="tap w-full mt-2 py-3 rounded-2xl bg-white border border-ink-200 text-ink-700 font-bold">手で入力する</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== OCR結果 確認・修正 ============================== */
+function StepLabel({n,children}){
+  return (
+    <div className="flex items-center gap-2 mb-2">
+      <span className="w-5 h-5 rounded-full bg-ink-900 text-white text-[11px] font-black flex items-center justify-center">{n}</span>
+      <span className="text-[13px] font-black text-ink-800">{children}</span>
+    </div>
+  );
+}
+function Review({data, projects, docs, onSave, onCancel, onCreateProject, wide}){
+  const dpid = data.pid_hint || "";
+  const initItems = (data.items && data.items.length)
+    ? data.items.map(it=>({ name:it.name||"", amount:(it.unread||it.amount==null)?null:it.amount, pid:("pid" in it)?it.pid:dpid, _naming:!!it.needName, _name:(it.needName?(data.project_new||""):""), source:it.source||"ocr" }))
+    : [{ name:"書類全体", amount:(data.total>0?data.total:null), pid:dpid, source:"whole" }];
+  const [siteName,setSiteName] = useState("");
+  const [type,setType] = useState(data.type||"invoice");
+  const [dir,setDir]   = useState(data.dir||"cost");
+  const [partner,setPartner] = useState(data.partner||"");
+  const [date,setDate] = useState(data.date||TODAY);
+  const [origTotal,setOrigTotal] = useState(data.total||0);
+  const [items,setItems] = useState(initItems);
+  const [imgOpen,setImgOpen] = useState(true);
+  const [zoom,setZoom] = useState(false);
+  const [hi,setHi] = useState(-1);
+  const [creating,setCreating] = useState(false);
+  const [newName,setNewName] = useState(data.project_new||"");
+
+  const pname=(pid)=>(projects.find(p=>p.id===pid)||{}).name||"";
+  const setItem=(i,patch)=>setItems(arr=>arr.map((it,j)=>j===i?{...it,...patch}:it));
+  const addItem=()=>setItems(arr=>[...arr,{name:"",amount:null,pid:"",source:"manual"}]);
+  const removeItem=(i)=>setItems(arr=>arr.filter((_,j)=>j!==i));
+  const openImg=(i)=>{ setHi(i); setZoom(true); };
+
+  const sum = items.reduce((s,it)=>s+(it.amount||0),0);
+  const diff = origTotal>0 ? origTotal - sum : 0;
+  const needAmt = items.filter(it=>it.amount==null).length;
+  const needNm  = items.filter(it=>!(it.name||"").trim()).length;
+  const unassigned = items.filter(it=>!it.pid).length;
+  const groups = useMemo(()=>{
+    const g={};
+    items.forEach((it,idx)=>{ const k=it.pid||"__none"; (g[k]=g[k]||{pid:it.pid||"",rows:[],sum:0}).rows.push({...it,idx}); g[k].sum+=(it.amount||0); });
+    return Object.values(g).sort((a,b)=>(a.pid?1:0)-(b.pid?1:0));
+  },[items]);
+  const alloc = groups.filter(gp=>gp.pid).map(gp=>({ pid:gp.pid, amount:gp.sum, memo:(gp.rows.find(r=>r.name)||{}).name||"" }));
+  const dup = !data._existing && origTotal>0 && (docs||[]).some(d=> dupKey(d)===((partner||"").trim()+"|"+date+"|"+origTotal));
+  const commitNewSite=(idx)=>{ const nm=((items[idx]||{})._name||"").trim(); if(!nm)return; const id=onCreateProject(nm); setItem(idx,{pid:id,_naming:false,_name:""}); };
+  const onSiteChange=(idx,val)=>{ if(val==="__new__") setItem(idx,{_naming:true,pid:""}); else setItem(idx,{pid:val,_naming:false}); };
+
+  const blockers=[];
+  if(!partner.trim()) blockers.push("取引先");
+  if(needNm>0) blockers.push("品名"+needNm);
+  if(needAmt>0) blockers.push("金額"+needAmt);
+  if(unassigned>0) blockers.push("現場"+unassigned);
+  if(diff!==0) blockers.push("総額ズレ");
+  const canSave = blockers.length===0 && alloc.length>0;
+  const newSitePending = data.project_new && !projects.some(p=>p.name===data.project_new);
+
+  const ItemRow = ({row})=>(
+    <div className="border-t border-ink-100 pt-2.5 first:border-0 first:pt-0">
+      <button onClick={()=>openImg(row.idx)} className="tap w-full text-left flex items-center justify-between gap-2">
+        <span className="text-[13px] text-ink-800 truncate">{row.name||"（品名なし）"}</span>
+        <span className="text-[11px] text-brand-600 font-bold whitespace-nowrap">原本🔍</span>
+      </button>
+      <div className="flex gap-2 mt-1.5">
+        <input type="number" value={row.amount==null?"":row.amount} placeholder="読取不可・入力"
+          onChange={e=>setItem(row.idx,{amount:e.target.value===""?null:+e.target.value})}
+          className={"field num text-right py-2 w-1/3"+(row.amount==null?" border-amber-400 ring-2 ring-amber-200 bg-amber-50":"")} />
+        {row._naming ? (
+          <div className="flex gap-1 items-center flex-1">
+            <input value={row._name||""} placeholder="新しい現場名" onChange={e=>setItem(row.idx,{_name:e.target.value})} onKeyDown={e=>{ if(e.key==="Enter") commitNewSite(row.idx); }} className="field py-2 flex-1 bg-blue-50 ring-2 ring-blue-300" />
+            <button onClick={()=>commitNewSite(row.idx)} className="tap shrink-0 px-3 rounded-xl bg-blue-600 text-white text-[12px] font-black">登録</button>
+          </div>
+        ) : (
+          <select value={row.pid} onChange={e=>onSiteChange(row.idx,e.target.value)}
+            className={"field py-2 text-[13px] font-bold flex-1"+(!row.pid?" border-amber-400 ring-2 ring-amber-200 bg-amber-50":"")}>
+            <option value="">現場を選ぶ</option>
+            {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+            <option value="__new__">＋ 新しい現場を登録…</option>
+          </select>
+        )}
+        {row.source==="manual" && <button onClick={()=>removeItem(row.idx)} className="tap px-2 text-ink-400 text-[16px]">×</button>}
+      </div>
+    </div>
+  );
+
+  const imageSmall = data._tint ? (
+    <div>
+      <div className="flex items-center justify-between mb-1.5">
+        <span className="text-[11px] text-ink-500 font-bold">撮影した書類（原本）</span>
+        <button onClick={()=>setImgOpen(o=>!o)} className="tap text-[12px] text-brand-600 font-bold">{imgOpen?"画像を隠す ▲":"画像を表示 ▼"}</button>
+      </div>
+      {imgOpen && (
+        <button onClick={()=>openImg(-1)} className="tap w-full block">
+          <div className={"relative rounded-2xl overflow-hidden border border-ink-200 bg-gradient-to-br "+data._tint+" h-32 flex items-center justify-center"}>
+            <div className="text-5xl opacity-50">{(DOCTYPE[type]||{icon:"📄"}).icon}</div>
+            <span className="absolute bottom-2 right-2 chip bg-black/50 text-white">タップで拡大 🔍</span>
+          </div>
+        </button>
+      )}
+    </div>
+  ) : (
+    <div className="rounded-2xl border border-dashed border-ink-300 h-16 flex items-center justify-center text-ink-400 text-[12px] font-bold">手入力（写真なし）</div>
+  );
+
+  const imageBig = data._tint ? (
+    <div className="h-full flex flex-col">
+      <div className="text-[12px] text-ink-500 font-bold mb-2">撮影した書類（原本）・クリックで拡大</div>
+      <button onClick={()=>openImg(-1)} className="tap flex-1 min-h-0 block">
+        <div className={"relative w-full h-full min-h-[340px] rounded-2xl overflow-hidden border border-ink-200 bg-gradient-to-br "+data._tint+" flex items-center justify-center"}>
+          <div className="text-8xl opacity-50">{(DOCTYPE[type]||{icon:"📄"}).icon}</div>
+          <span className="absolute bottom-3 right-3 chip bg-black/50 text-white">拡大 🔍</span>
+        </div>
+      </button>
+    </div>
+  ) : (
+    <div className="h-full min-h-[340px] rounded-2xl border border-dashed border-ink-300 flex items-center justify-center text-ink-400 text-[13px] font-bold">手入力（写真なし）</div>
+  );
+
+  const s = data._summary;
+  const summaryBanner = s && (s.matched>0||s.created>0||s.need>0||s.lines>2) && (
+    <div className="rounded-xl bg-gradient-to-br from-emerald-500 to-emerald-600 text-white p-3.5 fadeup">
+      <div className="text-[14px] font-black">✨ AIが自動で処理しました</div>
+      <div className="text-[12px] mt-1.5 space-y-1 text-emerald-50">
+        <div>📄 <b>{s.lines}明細</b>を読み取りました</div>
+        {s.matched>0 && <div>🏗 <b>{s.matched}現場</b>を既存の案件に自動ひも付け（名寄せ）</div>}
+        {s.created>0 && <div>🆕 <b>{s.created}現場</b>を新規案件として自動登録しました</div>}
+        {s.need>0 && <div>✍ <b>{s.need}件</b>は新しい現場を検出 → 表の「工事名」欄で名前を入力してください</div>}
+        {s.unread>0 && <div>🔎 <b>{s.unread}件</b>は金額をご確認ください</div>}
+      </div>
+    </div>
+  );
+
+  const alertsBlock = dup ? (
+    <div className="rounded-xl bg-rose-50 border border-rose-200 p-3">
+      <div className="text-[13px] font-black text-rose-700">⚠️ 同じ書類が登録済みかもしれません</div>
+      <div className="text-[11px] text-rose-600 mt-0.5">取引先・日付・金額が一致する書類があります。二重計上に注意。</div>
+    </div>
+  ) : null;
+
+  const headerCard = (
+    <div className="card p-3 space-y-2">
+      <div><div className="text-[11px] text-ink-500 font-bold mb-1">取引先</div>
+        <input className={"field py-2"+(!partner.trim()?" border-amber-400 ring-2 ring-amber-200 bg-amber-50":"")} placeholder="読取不可・入力" value={partner} onChange={e=>setPartner(e.target.value)} /></div>
+      <div className="grid grid-cols-2 gap-2">
+        <div><div className="text-[11px] text-ink-500 font-bold mb-1">発行日</div><input type="date" className="field num py-2" value={date} onChange={e=>setDate(e.target.value)} /></div>
+        <div><div className="text-[11px] text-ink-500 font-bold mb-1">請求金額（税込）</div><input type="number" className="field num text-right py-2" placeholder="0" value={origTotal||""} onChange={e=>setOrigTotal(+e.target.value)} /></div>
+      </div>
+      <div className="flex items-center gap-2 text-[12px] pt-0.5">
+        <span className="text-ink-400 font-bold">区分</span>
+        <button onClick={()=>setDir(dir==="cost"?"sales":"cost")} className={"tap chip border "+(dir==="cost"?"bg-rose-50 text-rose-700 border-rose-200":"bg-emerald-50 text-emerald-700 border-emerald-200")}>{dir==="cost"?"原価（仕入）":"売上（請求）"}</button>
+        <span className="text-ink-300">·</span>
+        <span className="text-ink-600 font-bold">{(DOCTYPE[type]||{}).label}</span>
+        <span className="text-ink-400">AIが自動判定（違えばタップ）</span>
+      </div>
+    </div>
+  );
+
+  const newSiteBlock = newSitePending && (
+    <div className="rounded-xl bg-amber-50 border border-amber-200 p-3 flex items-center justify-between gap-2">
+      <span className="text-[12px] font-black text-amber-800">AI候補「{data.project_new}」は未登録</span>
+      <button onClick={()=>onCreateProject(data.project_new)} className="tap px-3 py-1.5 rounded-lg bg-amber-500 text-white text-[12px] font-black whitespace-nowrap">＋ 登録</button>
+    </div>
+  );
+
+  const addRowBtn = (
+    <button onClick={addItem} className="tap w-full py-3 rounded-xl border border-dashed border-ink-300 text-ink-600 font-bold text-[13px]">＋ 明細の行を追加（原本にあるのに未検出）</button>
+  );
+  const createSiteBlock = creating ? (
+    <div className="flex gap-2">
+      <input className="field" placeholder="新しい現場名" value={newName} onChange={e=>setNewName(e.target.value)} />
+      <button onClick={()=>{ if(newName.trim()){ onCreateProject(newName.trim()); setNewName(""); setCreating(false); } }} className="tap px-4 rounded-xl bg-ink-900 text-white font-black text-[13px] whitespace-nowrap">登録</button>
+    </div>
+  ) : (
+    <button onClick={()=>setCreating(true)} className="tap text-[13px] text-brand-600 font-black">＋ 新しい現場を登録</button>
+  );
+  const siteBreakdown = alloc.length>0 && (
+    <div className="flex flex-wrap items-center gap-1.5">
+      <span className="text-[11px] text-ink-400 font-bold">現場別:</span>
+      {alloc.map((a,i)=><span key={i} className="chip bg-ink-100 text-ink-700">🏗 {pname(a.pid)} {yen(a.amount)}</span>)}
+    </div>
+  );
+
+  // モバイル：現場ごとの束カード
+  const groupsBlock = (
+    <>
+      <div className="label px-1">明細（{items.length}行）を現場へ</div>
+      {groups.map((gp,gi)=>(
+        <div key={gi} className={"card p-4 "+(!gp.pid?"border-amber-300 bg-amber-50/40":"")}>
+          <div className="flex items-center justify-between mb-2">
+            <span className={"font-black "+(gp.pid?"text-ink-900":"text-amber-700")}>{gp.pid?"🏗 "+pname(gp.pid):"⚠ 未割当"}</span>
+            <span className="num font-black text-ink-800">{yen(gp.sum)}<span className="text-ink-400 text-[11px] font-bold ml-1">{gp.rows.length}行</span></span>
+          </div>
+          {gp.rows.map(row=><ItemRow key={row.idx} row={row} />)}
+        </div>
+      ))}
+    </>
+  );
+
+  // PC：編集できる明細テーブル（日本の業務帳票スタイル・罫線）
+  const tableBlock = (
+    <div className="rounded-xl border border-ink-300 overflow-hidden">
+      <div className="overflow-x-auto scroll-thin">
+        <table className="w-full text-[13px] border-collapse">
+          <thead>
+            <tr className="bg-ink-100 text-ink-700 text-left divide-x divide-ink-200 border-b border-ink-300">
+              <th className="py-2 px-2 font-black text-center whitespace-nowrap w-16">状態</th>
+              <th className="py-2 px-2 font-black">品名・摘要</th>
+              <th className="py-2 px-2 font-black text-right whitespace-nowrap w-32">金額（税込）</th>
+              <th className="py-2 px-2 font-black whitespace-nowrap">工事名（現場）</th>
+              <th className="py-2 px-2 font-black text-center whitespace-nowrap w-16">原本</th>
+            </tr>
+          </thead>
+          <tbody>
+            {items.map((it,idx)=>{ const nN=!(it.name||"").trim(); const nA=it.amount==null; const nS=!it.pid; const need=nN||nA||nS; return (
+              <tr key={idx} style={{animationDelay:(idx*45)+"ms"}}
+                  className={"rowin divide-x divide-ink-100 border-b border-ink-100 "+(need?"bg-amber-50":(idx%2?"bg-ink-50/40":"bg-white"))}>
+                <td className="px-1 py-1 text-center whitespace-nowrap">{need?<span className="chip bg-amber-100 text-amber-800 border border-amber-200">要編集</span>:<span className="text-emerald-600 font-black">✓</span>}</td>
+                <td className="px-1 py-1"><input value={it.name} placeholder="（品名を入力）" onChange={e=>setItem(idx,{name:e.target.value})} className={"w-full min-w-[130px] outline-none rounded px-1.5 py-1 focus:ring-2 focus:ring-brand-300 "+(nN?"bg-amber-100/70 placeholder-amber-700 font-bold":"bg-transparent text-ink-800")} /></td>
+                <td className="px-1 py-1 text-right"><input type="number" value={it.amount==null?"":it.amount} placeholder="要入力" onChange={e=>setItem(idx,{amount:e.target.value===""?null:+e.target.value})} className={"w-full text-right num font-bold outline-none rounded px-1.5 py-1 focus:ring-2 focus:ring-brand-300 "+(nA?"bg-amber-100/70 placeholder-amber-700":"bg-transparent text-ink-800")} /></td>
+                <td className={"px-1 py-1 "+(it.pid&&!it._naming?"snap":"")} style={it.pid&&!it._naming?{animationDelay:(idx*45+150)+"ms"}:undefined}>{it._naming ? (
+                  <div className="flex gap-1 items-center">
+                    <input autoFocus value={it._name||""} placeholder="新しい現場名を入力" onChange={e=>setItem(idx,{_name:e.target.value})} onKeyDown={e=>{ if(e.key==="Enter") commitNewSite(idx); }} className="w-full min-w-[110px] rounded px-1.5 py-1 bg-blue-50 ring-2 ring-blue-300 outline-none font-bold text-ink-800" />
+                    <button onClick={()=>commitNewSite(idx)} className="tap shrink-0 px-2.5 py-1 rounded-lg bg-blue-600 text-white text-[11px] font-black">登録</button>
+                  </div>
+                ) : (
+                  <select value={it.pid} onChange={e=>onSiteChange(idx,e.target.value)} className={"w-full outline-none rounded px-1.5 py-1 font-bold focus:ring-2 focus:ring-brand-300 "+(nS?"bg-amber-100/70 text-amber-700":"bg-transparent text-ink-800")}>
+                    <option value="">（現場を選択）</option>
+                    {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+                    <option value="__new__">＋ 新しい現場を登録…</option>
+                  </select>
+                )}</td>
+                <td className="px-1 py-1 text-center whitespace-nowrap"><button onClick={()=>openImg(idx)} className="tap text-[11px] text-brand-600 font-bold">照合</button>{it.source==="manual" && <button onClick={()=>removeItem(idx)} className="tap text-ink-400 ml-1 text-[15px]">×</button>}</td>
+              </tr>
+            );})}
+          </tbody>
+          <tfoot>
+            <tr className="bg-ink-100 text-ink-900 font-black divide-x divide-ink-200 border-t border-ink-300">
+              <td className="px-2 py-2 text-center whitespace-nowrap" colSpan="2">合計（{items.length}明細）</td>
+              <td className="px-2 py-2 text-right num">{yen(sum)}</td>
+              <td className="px-2 py-2 text-[11px] whitespace-nowrap" colSpan="2">{origTotal>0 && (diff===0?<span className="text-emerald-600">請求額と一致 ✓</span>:<span className="text-rose-600">請求額と{yen(Math.abs(diff))}差</span>)}</td>
+            </tr>
+          </tfoot>
+        </table>
+      </div>
+    </div>
+  );
+
+  const footer = (
+    <div className={wide ? "shrink-0 border-t border-ink-200 bg-white px-4 py-3" : "fixed bottom-0 inset-x-0 max-w-[430px] mx-auto bg-white border-t border-ink-200 px-3 pt-2 pb-3 z-30"}>
+      <div className="flex items-center justify-between text-[12px] mb-2 px-1">
+        <span className="text-ink-500 font-bold">明細合計 <span className="num text-ink-900 font-black">{yen(sum)}</span>{origTotal>0 && <span> / 原本 <span className="num text-ink-700">{yen(origTotal)}</span></span>}</span>
+        {origTotal>0 && (diff===0
+          ? <span className="text-emerald-600 font-black">✓ 一致</span>
+          : <span className="text-rose-600 font-black">{yen(Math.abs(diff))}ずれ</span>)}
+      </div>
+      <div className="flex gap-3">
+        <button onClick={onCancel} className="tap px-5 py-3 rounded-xl font-bold text-ink-600 bg-ink-100">やめる</button>
+        <button disabled={!canSave} onClick={()=>onSave({ type, dir, partner, date, total:origTotal||sum, allocations:alloc, lines: items.map(it=>({ name:it.name, amount:it.amount, pid:it.pid, site:pname(it.pid) })) })}
+          className={"tap flex-1 py-3 rounded-xl font-black text-white shadow-lg "+(canSave?(dup?"bg-rose-500 shadow-rose-200":"bg-brand-500 shadow-brand-200"):"bg-ink-300 shadow-none")}>
+          {!canSave ? "未入力があります" : dup ? "重複の可能性・登録" : data._existing ? "更新する" : "登録する"}
+        </button>
+      </div>
+    </div>
+  );
+
+  const zoomOverlay = zoom && (
+    <div className="fixed inset-0 z-[70] bg-black/80 flex items-center justify-center p-5" onClick={()=>setZoom(false)}>
+      <div className="bg-white rounded-lg w-full max-w-[420px] max-h-[88vh] overflow-auto p-6" onClick={e=>e.stopPropagation()}>
+        <div className="text-[14px] font-black text-ink-800">{DOCTYPE[type]?DOCTYPE[type].label:"書類"}</div>
+        <div className="text-[12px] text-ink-500">{partner||"（取引先）"} / {date}</div>
+        <div className="h-px bg-ink-200 my-3"></div>
+        <div className="space-y-1">
+          {items.map((it,idx)=>(
+            <div key={idx} className={"flex justify-between items-center text-[13px] px-2 py-2 rounded "+(idx===hi?"bg-amber-200 font-black ring-1 ring-amber-400":"")}>
+              <span className="truncate mr-2">{it.name||"（品名）"}</span>
+              <span className="num">{it.amount!=null?yen(it.amount):"—"}</span>
+            </div>
+          ))}
+        </div>
+        <div className="h-px bg-ink-200 my-3"></div>
+        <div className="flex justify-between text-[14px] font-black"><span>合計</span><span className="num">{yen(origTotal)}</span></div>
+        <div className="text-center text-[11px] text-ink-400 mt-3">（デモ用の原本イメージ・タップで閉じる）</div>
+      </div>
+    </div>
+  );
+
+  if(wide){
+    return (
+      <div className="flex flex-col h-full">
+        <Header title="アップロードした請求書の確認" sub="左の原本と見くらべて、明細表をチェック（黄色＝要編集）" onBack={onCancel} />
+        <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+          <div className="border-r border-ink-200 bg-ink-100/50 p-5 overflow-auto">{imageBig}</div>
+          <div className="p-5 overflow-auto space-y-4">
+            {alertsBlock}
+            {headerCard}
+            <div className="flex items-center justify-between px-1">
+              <span className="label">明細（{items.length}行）</span>
+              <span className="text-[11px] text-amber-700 font-bold">黄色＝要編集</span>
+            </div>
+            {tableBlock}
+            {addRowBtn}
+          </div>
+        </div>
+        {footer}
+        {zoomOverlay}
+      </div>
+    );
+  }
+  return (
+    <div className="pb-40">
+      <Header title="明細を現場に振り分け" sub="原本と見くらべて割り当て・保存" onBack={onCancel} />
+      <div className="px-4 pt-4 space-y-4">
+        {imageSmall}
+        {alertsBlock}
+        {headerCard}
+        {groupsBlock}
+        {addRowBtn}
+      </div>
+      {footer}
+      {zoomOverlay}
+    </div>
+  );
+}
+
+/* ============================== 案件詳細 ============================== */
+function Project({p, docs, onBack, onExport}){
+  const ds = docs.filter(d=>d.pid===p.id).sort((a,b)=>b.date.localeCompare(a.date));
+  const doExport=(kind)=>{
+    const header=["日付","書類種別","区分","取引先","書類番号","金額(税込)","案件名"];
+    const rows=ds.map(d=>[d.date, DOCTYPE[d.type].label, DIR[d.dir].label, d.partner, d.no||"", d.total, p.name]);
+    onExport({ kind, title:`${p.name}・${ds.length}行`, matrix:[header,...rows] });
+  };
+  return (
+    <div className="pb-28">
+      <Header title={p.name} sub={p.client} onBack={onBack} />
+      <div className="px-4 pt-4">
+        <div className="card p-4">
+          <div className="grid grid-cols-3 gap-2 text-center">
+            <div><div className="text-[11px] text-ink-500 font-bold">売上</div><div className="num font-black text-lg">{man(p.sales)}</div></div>
+            <div><div className="text-[11px] text-ink-500 font-bold">原価</div><div className="num font-black text-lg text-rose-600">{man(p.cost)}</div></div>
+            <div><div className="text-[11px] text-brand-700 font-bold">粗利</div><div className="num font-black text-lg text-brand-700">{man(p.profit)}</div></div>
+          </div>
+          <div className="mt-3 h-2 rounded-full bg-rose-100 overflow-hidden">
+            <div className="h-full bg-emerald-400" style={{width:Math.max(0,Math.min(100,p.rate))+"%"}}></div>
+          </div>
+          <div className="text-[11px] text-ink-500 mt-1 text-right">粗利率 {p.rate}%</div>
+        </div>
+
+        <div className="flex gap-2 mt-4">
+          <button onClick={()=>doExport("csv")} className="tap flex-1 py-3 rounded-xl bg-ink-900 text-white font-bold text-[13px]">CSV出力</button>
+          <button onClick={()=>doExport("excel")} className="tap flex-1 py-3 rounded-xl bg-white border border-ink-200 text-ink-700 font-bold text-[13px]">Excelにコピー</button>
+        </div>
+
+        <div className="label mt-5 mb-2 px-1">書類（{ds.length}枚）</div>
+        <div className="space-y-2">
+          {ds.map(d=>(
+            <div key={d.id} className="card p-3 flex items-center gap-3">
+              <div className={"w-10 h-10 rounded-xl flex items-center justify-center text-xl "+(d.dir==="cost"?"bg-rose-50":"bg-emerald-50")}>{DOCTYPE[d.type].icon}</div>
+              <div className="flex-1 min-w-0">
+                <div className="font-bold text-ink-900 truncate">{d.partner}</div>
+                <div className="text-[11px] text-ink-500">{DOCTYPE[d.type].label}・{d.date}{d.memo?`・${d.memo}`:""}</div>
+              </div>
+              <div className="text-right">
+                <div className={"num font-black "+(d.dir==="cost"?"text-rose-600":"text-emerald-600")}>{d.dir==="cost"?"−":"+"}{yen(d.total)}</div>
+                <span className={"chip "+DIR[d.dir].cls} style={{marginTop:2}}>{d.dir==="cost"?"原価":"売上"}</span>
+              </div>
+            </div>
+          ))}
+          {!ds.length && <div className="text-center text-ink-400 text-[13px] py-8">まだ書類がありません。撮影して追加しましょう。</div>}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== エクスポート・モーダル（汎用） ============================== */
+function ExportModal({exp, onClose, onCopied}){
+  const { title, matrix } = exp;
+  const tsv = matrix.map(r=>r.map(c=>c==null?"":String(c)).join("\t")).join("\n");
+  const q=(s)=>{ s=String(s==null?"":s); return /[",\n\r]/.test(s)?'"'+s.replace(/"/g,'""')+'"':s; };
+  const csv = matrix.map(r=>r.map(q).join(",")).join("\r\n");
+  const copyPaste=()=>{ try{navigator.clipboard&&navigator.clipboard.writeText(tsv);}catch(e){} onCopied("コピーしました。Excelに貼り付けできます"); onClose(); };
+  const download=()=>{ try{
+      const blob=new Blob(["﻿"+csv],{type:"text/csv;charset=utf-8;"});
+      const url=URL.createObjectURL(blob); const a=document.createElement("a"); a.href=url; a.download=(title||"現場そろばん")+".csv"; document.body.appendChild(a); a.click(); a.remove(); URL.revokeObjectURL(url);
+      onCopied("CSVをダウンロードしました");
+    }catch(e){ onCopied("この環境ではダウンロード不可。コピーをご利用ください"); } onClose(); };
+  return (
+    <div className="fixed inset-0 z-[55] bg-black/50 flex items-center justify-center p-4" onClick={onClose}>
+      <div className="bg-white w-full max-w-[460px] rounded-2xl p-5 fadeup shadow-2xl" onClick={e=>e.stopPropagation()}>
+        <div className="font-black text-ink-900 text-[16px]">Excelへ出す</div>
+        <div className="text-[12px] text-ink-500 mb-3">{title}・{Math.max(0,matrix.length-1)}行</div>
+        <pre className="bg-ink-900 text-ink-100 text-[10px] rounded-xl p-3 overflow-auto scroll-thin num max-h-44" style={{whiteSpace:"pre"}}>{tsv}</pre>
+        <div className="grid grid-cols-2 gap-2 mt-3">
+          <button onClick={copyPaste} className="tap py-3 rounded-xl bg-brand-500 text-white font-black text-[13px]">Excelに貼る（コピー）</button>
+          <button onClick={download} className="tap py-3 rounded-xl bg-ink-900 text-white font-black text-[13px]">CSVをダウンロード</button>
+        </div>
+        <div className="text-[11px] text-ink-400 mt-2 text-center">貼る＝そのままExcelへ／CSV＝会計にそのまま渡せる（日本語も文字化けしません）</div>
+        <button onClick={onClose} className="tap w-full mt-3 py-2.5 rounded-xl bg-ink-100 text-ink-600 font-bold">閉じる</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 取引先データ（自動蓄積） ============================== */
+function Customers({docs, projects}){
+  const list = useMemo(()=>{
+    const m = {};
+    docs.forEach(d=>{
+      const k=d.partner; m[k]=m[k]||{name:k,cost:0,sales:0,count:0,last:""};
+      m[k][d.dir]+=d.total; m[k].count++; if(d.date>m[k].last)m[k].last=d.date;
+    });
+    return Object.values(m).sort((a,b)=>(b.cost+b.sales)-(a.cost+a.sales));
+  },[docs]);
+  return (
+    <div className="pb-28">
+      <Header title="取引先データ" sub="書類から自動で貯まります" />
+      <div className="px-4 pt-4 space-y-2">
+        <div className="gloss mb-1">保存するたびに、取引先・取引額・最終取引日がAIで名寄せされて自動蓄積されます。</div>
+        {list.map((c,i)=>(
+          <div key={i} className="card p-3 flex items-center gap-3">
+            <div className="w-9 h-9 rounded-full bg-ink-100 flex items-center justify-center font-black text-ink-500">{c.name[0]}</div>
+            <div className="flex-1 min-w-0">
+              <div className="font-bold text-ink-900 truncate">{c.name}</div>
+              <div className="text-[11px] text-ink-500">取引{c.count}件・最終 {c.last}</div>
+            </div>
+            <div className="text-right text-[11px]">
+              {c.sales>0 && <div className="num text-emerald-600 font-bold">売上 {man(c.sales)}</div>}
+              {c.cost>0 && <div className="num text-rose-600 font-bold">仕入 {man(c.cost)}</div>}
+            </div>
+          </div>
+        ))}
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 実装ガイド（外注ハンドオフ用・PCから開く） ============================== */
+function Guide({onClose}){
+  const Sec = ({n,title,children,open}) => (
+    <details className="card overflow-hidden" open={open}>
+      <summary className="px-4 py-3 font-black text-ink-900 flex items-center justify-between">
+        <span><span className="text-brand-600 mr-2">{n}</span>{title}</span><span className="text-ink-300">▾</span>
+      </summary>
+      <div className="px-4 pb-4 border-t border-ink-100 pt-3 space-y-2">{children}</div>
+    </details>
+  );
+  const Row = ({k,v}) => (<div className="flex text-[12.5px] py-0.5 gap-2"><span className="w-28 shrink-0 text-ink-500 font-bold">{k}</span><span className="text-ink-800">{v}</span></div>);
+  return (
+    <div className="fixed inset-0 z-[60] bg-black/50 flex justify-center overflow-auto p-2 md:p-6" onClick={onClose}>
+      <div className="bg-ink-50 rounded-2xl w-full max-w-[820px] shadow-2xl" onClick={e=>e.stopPropagation()}>
+        <div className="sticky top-0 bg-white/95 backdrop-blur border-b border-ink-200 px-5 py-3 flex items-center justify-between rounded-t-2xl">
+          <div><div className="font-black text-ink-900">現場そろばん 実装ガイド</div><div className="text-[11px] text-ink-500">Bubble実装 / 外注ハンドオフ用</div></div>
+          <button onClick={onClose} className="tap px-4 py-2 rounded-xl bg-ink-100 text-ink-600 font-bold text-[13px]">閉じる</button>
+        </div>
+        <div className="p-5 space-y-3">
+          <div className="impl"><b>プロダクト：現場そろばん</b><br/>「<b>現場の紙（請求書・日報）を放り込むだけ</b>」で、AIが明細を読み取り→<b>現場ごとに自動で振り分け</b>→原価・利益・入出金・日報が自動でまとまる。<b>事務所＝PC（取り込み・集計）／現場＝スマホ（自分の現場の利益＋スキャン）</b>。データは共有。北極星は「現場ごとにいくら儲かっているかが、最初に見える」。</div>
+
+          <Sec n="1" title="業務フロー" open={true}>
+            <div className="impl">① PCに請求書/日報をD&D → ② Vision APIが<b>書類種別を判定</b>し明細をJSON化 → ③ 各明細の<b>現場名を既存案件へ名寄せ／無ければ自動登録／判別不能はその場命名</b> → ④ 確認画面（左＝原本／右＝明細表）で<b>黄色い"要編集"だけ</b>直す → ⑤「登録する」で保存＆明細をクリップボードへ → ⑥ <b>現場ごとの利益</b>を最上段に、明細一覧・日次入出金・日報が自動集計。CSV/Excel出力。</div>
+            <div className="gloss">MVPで<b>やらない</b>こと：承認、支払消込、写真台帳、会計連携。まず「紙の束が、放り込むだけで片づく」の1点に集中。</div>
+          </Sec>
+
+          <Sec n="2" title="画面">
+            <Row k="事務所(PC)" v="① アップロード(D&D) ② 確認(全画面2ペイン：原本＋編集明細表) ③ 現場ごとの利益＋明細一覧(修正)＋日次入出金＋日報一覧。空なら3ステップのオンボ" />
+            <Row k="現場(スマホ)" v="① 現場ごとの利益(閲覧) ② スキャン(連続撮影→未確認トレイ→確認)。実機フレームで表示" />
+            <div className="gloss">Bubbleは<b>Responsive</b>で。PCは1200px級のダッシュボード、スマホは幅430px単一カラム。確認画面はPC=大モーダル2ペイン／スマホ=縦1カラムに出し分け。</div>
+          </Sec>
+
+          <Sec n="3" title="データ設計（Bubble Data Types）">
+            <div className="impl">
+              <b>Project（現場/案件）</b>：name / client(text) / sales_expected(number) / auto(yes/no ＝スキャン自動作成) / created_by<br/>
+              <b>Document（書類）</b>：doc_type(invoice/delivery/order/receipt) / direction(cost/売上 sales) / partner / doc_date / src_total(原本合計) / doc_no / image / raw_json / confidence / created_by<br/>
+              <b>Item（明細行・最小単位）</b>：document(Document) / <b>project(Project)</b> / name / amount / <b>bbox(text 原本座標)</b> / unreadFlags<br/>
+              <b>Report（日報）</b>：project / report_date / weather(option) / workers(list text) / start_time / end_time / work(text) / materials(text) / created_by
+            </div>
+            <div className="gloss"><b>肝：Documentは現場を持たない。現場は明細行(Item)側に持つ</b>（1枚に複数現場が混在するため）。現場別の原価は <b>Item.amount を project でグループ合算（＝実額積み上げ）</b>。税は原本合計で突合するのみ（税抜/税込の混在は src_total と明細合計の一致チェックで検知）。</div>
+          </Sec>
+
+          <Sec n="4" title="OCR：OpenAI Vision API 仕様（2種）">
+            <div className="impl"><b>呼び出し</b>：Backend workflow → POST <code>api.openai.com/v1/chat/completions</code>、model=<code>gpt-4o</code>、image_url＋プロンプト、<code>response_format: json_object</code>。まず <b>kind(invoice/report)</b> を判定して分岐。<b>読み取れない値は null</b>（＝UIで"要編集"黄色表示）。<b>各明細に bbox</b>（正規化座標）を返させ、行タップで原本ハイライト。</div>
+            <pre className="bg-ink-900 text-emerald-200 text-[10.5px] rounded-xl p-3 overflow-x-auto scroll-thin" style={{whiteSpace:"pre"}}>{`// 請求書
+{ "kind":"invoice", "direction":"cost|sales",
+  "partner":"取引先名", "doc_date":"YYYY-MM-DD", "total":0, "doc_no":"",
+  "items":[ {"name":"品名 or null","amount":0|null,
+             "site_hint":"この行の現場名 or ''",
+             "bbox":[x,y,w,h]} ],
+  "confidence":0.0 }
+// 日報
+{ "kind":"report", "site_hint":"現場名", "date":"YYYY-MM-DD",
+  "weather":"晴|曇|雨|雪", "workers":["氏名",...],
+  "start_time":"HH:MM","end_time":"HH:MM",
+  "work":"作業内容 or null", "materials":"" }`}</pre>
+          </Sec>
+
+          <Sec n="5" title="名寄せ＆現場の自動登録（感動の核）">
+            <div className="impl">各 site_hint を<b>正規化（空白除去）して既存Project名と部分一致</b>で名寄せ → 見つかれば紐付け（例「A邸」→「大和ハウス様 A邸 新築」）。<br/>見つからなければ<b>Projectを自動作成</b>（auto=yes）してその場で紐付け。<br/>現場名が読めない/曖昧な明細だけ<b>行内で"現場名を入力→登録"</b>（find or create）。<br/>UIは"未割当/読取不可/総額ズレ"が残ると保存不可＝原価漏れ・二重計上を根絶。</div>
+          </Sec>
+
+          <Sec n="6" title="集計・出力">
+            <Row k="現場原価" v="Σ Item(direction=cost).amount を project で合算（実額積み上げ）" />
+            <Row k="現場売上" v="Σ 売上明細.amount（無ければ sales_expected）" />
+            <Row k="粗利/率" v="売上−原価 ／ 粗利÷売上×100（売上0は0%）" />
+            <Row k="日次入出金" v="doc_date でグループ、direction別に 入金(sales)/出金(cost) を合算" />
+            <Row k="日報一覧" v="Report を現場・日付で一覧／CSV" />
+            <div className="gloss"><b>CSV</b>＝Download data as CSV。<b>Excel貼付</b>＝登録時に明細をTSVで自動クリップボードコピー（"Copy to clipboard"）。重複検知＝取引先＋日付＋原本合計の一致で警告。</div>
+          </Sec>
+
+          <Sec n="7" title="権限・セキュリティ">
+            <Row k="管理者(事務所)" v="全現場・利益・アップロード・修正・CSV" />
+            <Row k="担当(現場)" v="自分の現場の利益閲覧＋スキャン" />
+            <div className="gloss">Privacy Rules で現場スコープを制御。<b>API Key はBackend workflowに隠蔽</b>し、画像→OCR→保存もBackendで実行（クライアントに鍵を出さない）。</div>
+          </Sec>
+
+          <Sec n="8" title="Phase2以降">
+            <Row k="労務原価" v="日報の 作業員×時間×日当 を現場原価に加算し粗利に反映" />
+            <Row k="支払/入金" v="支払期日・入金消込でキャッシュフロー" />
+            <Row k="会計連携" v="freee/マネフォへ自動仕訳、電帳法対応の原本保管" />
+          </Sec>
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 日報：一覧 ============================== */
+function Reports({reports, projects, onNew, onOpen}){
+  const pname = (pid)=> (projects.find(p=>p.id===pid)||{}).name || "";
+  const sorted = [...reports].sort((a,b)=>b.date.localeCompare(a.date));
+  return (
+    <div className="pb-28">
+      <Header title="作業日報" sub={`${reports.length}件・話すだけで下書き`} />
+      <div className="px-4 pt-4">
+        <button onClick={onNew} className="tap w-full py-3.5 rounded-2xl bg-brand-500 text-white font-black shadow-lg shadow-brand-200 flex items-center justify-center gap-2">
+          <span className="text-lg">＋</span>今日の日報を書く
+        </button>
+        <div className="label mt-5 mb-2 px-1">これまでの日報</div>
+        <div className="space-y-2">
+          {sorted.map(r=>(
+            <button key={r.id} onClick={()=>onOpen(r)} className="tap card w-full text-left p-4 active:bg-ink-50">
+              <div className="flex items-center justify-between">
+                <div className="font-black text-ink-900">{r.date}</div>
+                <span className="chip bg-ink-100 text-ink-600">{r.weather}</span>
+              </div>
+              <div className="text-[12px] text-brand-700 font-bold mt-0.5">{pname(r.pid)}</div>
+              <div className="text-[12.5px] text-ink-700 mt-1.5 line-clamp-2">{r.work}</div>
+              <div className="flex items-center gap-3 mt-2 text-[11px] text-ink-500">
+                <span>👷 {r.workers.length}名</span>
+                <span>🕒 {r.start}–{r.end}</span>
+                <span>進捗 {r.progress}%</span>
+              </div>
+            </button>
+          ))}
+        </div>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 日報：作成・編集 ============================== */
+function ReportEditor({initial, projects, docs, onSave, onCancel}){
+  const [f,setF] = useState(initial || { pid:projects[0].id, date:TODAY, weather:"☀️晴", workers:[], start:"08:00", end:"17:00", work:"", materials:"", progress:0, note:"" });
+  const [rec,setRec] = useState("idle"); // idle | recording | done
+  const [transcript,setTranscript] = useState("");
+  const set=(k,v)=>setF(p=>({...p,[k]:v}));
+  const speak = ()=>{ setRec("recording"); setTranscript("");
+    setTimeout(()=>{ setTranscript(voiceSample.transcript); setF(v=>({...v, ...voiceSample.result})); setRec("done"); }, 1900); };
+  // 同じ現場でOCR済みの資材を候補に
+  const matHints = docs.filter(d=>d.pid===f.pid && d.memo).map(d=>d.memo);
+  return (
+    <div className="pb-28">
+      <Header title={initial?"日報を編集":"今日の日報"} sub="話して下書き→直して保存" onBack={onCancel} />
+      <div className="px-4 pt-4 space-y-4">
+        {/* 音声下書き */}
+        <div className="rounded-2xl bg-gradient-to-br from-brand-500 to-brand-600 text-white p-4">
+          <div className="text-[12px] font-bold text-brand-100">話すだけでAIが日報を作成</div>
+          <button onClick={speak} disabled={rec==="recording"}
+            className="tap mt-3 w-full py-3 rounded-xl bg-white/15 border border-white/30 font-black flex items-center justify-center gap-2 disabled:opacity-70">
+            {rec==="recording"
+              ? <><span className="inline-block w-3 h-3 rounded-full bg-red-400 animate-pulse"></span>録音中… 話してください</>
+              : <>🎙️ {rec==="done"?"もう一度話す":"話して下書きする"}</>}
+          </button>
+          {transcript && <div className="mt-3 text-[12px] bg-black/20 rounded-lg p-2.5 leading-relaxed">「{transcript}」<div className="text-brand-100 text-[11px] mt-1">→ AIが下の項目に整形しました。直して保存できます。</div></div>}
+        </div>
+
+        {/* 現場・日付・天候 */}
+        <div className="card p-4 space-y-3">
+          <div><div className="label mb-1">現場（案件）</div>
+            <select className="field font-bold" value={f.pid} onChange={e=>set("pid",e.target.value)}>
+              {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+            </select>
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><div className="label mb-1">日付</div><input type="date" className="field num" value={f.date} onChange={e=>set("date",e.target.value)} /></div>
+            <div><div className="label mb-1">天候</div>
+              <div className="flex gap-1.5">
+                {WEATHER.map(w=>(
+                  <button key={w} onClick={()=>set("weather",w)}
+                    className={"tap flex-1 py-2.5 rounded-lg text-[13px] font-bold border "+(f.weather===w?"bg-ink-900 text-white border-ink-900":"bg-white text-ink-500 border-ink-200")}>{w}</button>
+                ))}
+              </div>
+            </div>
+          </div>
+        </div>
+
+        {/* 作業員・時間 */}
+        <div className="card p-4 space-y-3">
+          <div><div className="label mb-1">作業員（カンマ区切り）</div>
+            <input className="field" placeholder="佐藤, 鈴木, 田中" value={f.workers.join(", ")}
+              onChange={e=>set("workers", e.target.value.split(/[,、]/).map(s=>s.trim()).filter(Boolean))} />
+            {f.workers.length>0 && <div className="text-[11px] text-ink-500 mt-1">👷 {f.workers.length}名</div>}
+          </div>
+          <div className="grid grid-cols-2 gap-3">
+            <div><div className="label mb-1">開始</div><input type="time" className="field num" value={f.start} onChange={e=>set("start",e.target.value)} /></div>
+            <div><div className="label mb-1">終了</div><input type="time" className="field num" value={f.end} onChange={e=>set("end",e.target.value)} /></div>
+          </div>
+        </div>
+
+        {/* 作業内容 */}
+        <div><div className="label mb-1">作業内容</div>
+          <textarea className="field" rows="3" placeholder="今日やった作業を記入（話して下書きも可）" value={f.work} onChange={e=>set("work",e.target.value)} />
+        </div>
+
+        {/* 使用資材（OCR候補あり） */}
+        <div><div className="label mb-1">使用資材</div>
+          <input className="field" placeholder="生コン、鉄筋 など" value={f.materials} onChange={e=>set("materials",e.target.value)} />
+          {matHints.length>0 && (
+            <div className="flex flex-wrap gap-1.5 mt-2">
+              <span className="text-[11px] text-ink-400 self-center">撮影済み書類から：</span>
+              {matHints.map((m,i)=>(
+                <button key={i} onClick={()=>set("materials", f.materials?f.materials+"、"+m:m)}
+                  className="tap chip bg-brand-50 text-brand-700 border border-brand-200">＋{m}</button>
+              ))}
+            </div>
+          )}
+        </div>
+
+        {/* 進捗 */}
+        <div><div className="label mb-1">進捗率 {f.progress}%</div>
+          <input type="range" min="0" max="100" step="5" value={f.progress} onChange={e=>set("progress",+e.target.value)}
+            className="w-full accent-brand-500" />
+        </div>
+
+        {/* 特記・安全 */}
+        <div><div className="label mb-1">特記・安全事項（任意）</div>
+          <textarea className="field" rows="2" placeholder="ヒヤリハット・連絡事項など" value={f.note} onChange={e=>set("note",e.target.value)} />
+        </div>
+      </div>
+
+      <div className="fixed bottom-0 inset-x-0 max-w-[430px] mx-auto bg-white border-t border-ink-200 p-3 flex gap-3 z-30">
+        <button onClick={onCancel} className="tap px-5 py-3 rounded-xl font-bold text-ink-600 bg-ink-100">キャンセル</button>
+        <button onClick={()=>onSave(f)} className="tap flex-1 py-3 rounded-xl font-black text-white bg-brand-500 shadow-lg shadow-brand-200">日報を保存</button>
+      </div>
+    </div>
+  );
+}
+
+/* ============================== 日報の確認（スキャン→登録） ============================== */
+function ReportReview({data, projects, onSave, onCancel, onCreateProject, wide}){
+  const norm=(s)=>(s||"").replace(/[\s　]/g,"");
+  const matchId=(raw)=>{ const n=norm(raw); if(!n)return ""; const p=projects.find(x=>{const pn=norm(x.name);return pn&&(pn.includes(n)||n.includes(pn));}); return p?p.id:""; };
+  const [pid,setPid]=useState(()=>matchId(data.siteRaw));
+  const [naming,setNaming]=useState(()=>!matchId(data.siteRaw));
+  const [newName,setNewName]=useState(data.siteRaw||"");
+  const [date,setDate]=useState(data.date||TODAY);
+  const [weather,setWeather]=useState(data.weather||"☀️晴");
+  const [workers,setWorkers]=useState(data.workers||[]);
+  const [start,setStart]=useState(data.start||"08:00");
+  const [end,setEnd]=useState(data.end||"17:00");
+  const [work,setWork]=useState(data.workUnread?"":(data.work||""));
+  const [materials,setMaterials]=useState(data.materials||"");
+  const commitSite=()=>{ if(!newName.trim())return; const id=onCreateProject(newName.trim()); setPid(id); setNaming(false); };
+  const needSite=!pid, needWork=!work.trim();
+  const canSave=!needSite && !needWork;
+  const acls=(bad)=>"field"+(bad?" border-amber-400 ring-2 ring-amber-200 bg-amber-50":"");
+
+  const imageBig = (
+    <div className="h-full flex flex-col">
+      <div className="text-[12px] text-ink-500 font-bold mb-2">撮影した日報（原本）</div>
+      <div className={"relative w-full flex-1 min-h-[300px] rounded-2xl overflow-hidden border border-ink-200 bg-gradient-to-br "+(data._tint||"from-sky-100 to-cyan-50")+" flex items-center justify-center"}>
+        <div className="text-8xl opacity-50">📝</div>
+      </div>
+    </div>
+  );
+
+  const fields = (
+    <>
+      <div className="card p-3 space-y-3">
+        <div>
+          <div className="text-[11px] text-ink-500 font-bold mb-1">工事名（現場）</div>
+          {naming ? (
+            <div className="flex gap-2">
+              <input value={newName} onChange={e=>setNewName(e.target.value)} placeholder="新しい現場名" className="field bg-blue-50 ring-2 ring-blue-300" />
+              <button onClick={commitSite} className="tap px-4 rounded-xl bg-blue-600 text-white font-black text-[13px] whitespace-nowrap">登録</button>
+            </div>
+          ) : (
+            <select value={pid} onChange={e=>{ e.target.value==="__new__"?setNaming(true):setPid(e.target.value); }} className={acls(needSite)+" font-bold"}>
+              <option value="">（現場を選択）</option>
+              {projects.map(p=><option key={p.id} value={p.id}>{p.name}</option>)}
+              <option value="__new__">＋ 新しい現場を登録…</option>
+            </select>
+          )}
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div><div className="text-[11px] text-ink-500 font-bold mb-1">作業日</div><input type="date" className="field num py-2" value={date} onChange={e=>setDate(e.target.value)} /></div>
+          <div><div className="text-[11px] text-ink-500 font-bold mb-1">天候</div>
+            <div className="flex gap-1">{WEATHER.map(w=><button key={w} onClick={()=>setWeather(w)} className={"tap flex-1 py-2 rounded-lg text-[13px] font-bold border "+(weather===w?"bg-ink-900 text-white border-ink-900":"bg-white text-ink-500 border-ink-200")}>{w[0]}</button>)}</div>
+          </div>
+        </div>
+        <div className="grid grid-cols-2 gap-2">
+          <div><div className="text-[11px] text-ink-500 font-bold mb-1">開始</div><input type="time" className="field num py-2" value={start} onChange={e=>setStart(e.target.value)} /></div>
+          <div><div className="text-[11px] text-ink-500 font-bold mb-1">終了</div><input type="time" className="field num py-2" value={end} onChange={e=>setEnd(e.target.value)} /></div>
+        </div>
+      </div>
+      <div>
+        <div className="text-[11px] text-ink-500 font-bold mb-1">作業員（カンマ区切り）</div>
+        <input className="field" placeholder="佐藤, 鈴木" value={workers.join(", ")} onChange={e=>setWorkers(e.target.value.split(/[,、]/).map(s=>s.trim()).filter(Boolean))} />
+      </div>
+      <div>
+        <div className="text-[11px] text-ink-500 font-bold mb-1">作業内容 {needWork && <span className="chip bg-amber-100 text-amber-800 border border-amber-200 ml-1">要編集</span>}</div>
+        <textarea rows="3" className={acls(needWork)} placeholder="読み取れません。原本を見て入力してください" value={work} onChange={e=>setWork(e.target.value)} />
+      </div>
+      <div>
+        <div className="text-[11px] text-ink-500 font-bold mb-1">使用資材（任意）</div>
+        <input className="field" placeholder="石膏ボード など" value={materials} onChange={e=>setMaterials(e.target.value)} />
+      </div>
+    </>
+  );
+
+  const footer = (
+    <div className={wide?"shrink-0 border-t border-ink-200 bg-white px-4 py-3 flex gap-3":"fixed bottom-0 inset-x-0 max-w-[430px] mx-auto bg-white border-t border-ink-200 p-3 flex gap-3 z-30"}>
+      <button onClick={onCancel} className="tap px-5 py-3 rounded-xl font-bold text-ink-600 bg-ink-100">やめる</button>
+      <button disabled={!canSave} onClick={()=>onSave({ pid, date, weather, workers, start, end, work, materials })}
+        className={"tap flex-1 py-3 rounded-xl font-black text-white shadow-lg "+(canSave?"bg-brand-500 shadow-brand-200":"bg-ink-300 shadow-none")}>{canSave?"登録する":"未入力があります"}</button>
+    </div>
+  );
+
+  if(wide) return (
+    <div className="flex flex-col h-full">
+      <Header title="作業日報の確認" sub="原本と見くらべて登録（黄色＝要編集）" onBack={onCancel} />
+      <div className="flex-1 min-h-0 grid grid-cols-[minmax(0,0.85fr)_minmax(0,1.15fr)]">
+        <div className="border-r border-ink-200 bg-ink-100/50 p-5 overflow-auto">{imageBig}</div>
+        <div className="p-5 overflow-auto space-y-4">{fields}</div>
+      </div>
+      {footer}
+    </div>
+  );
+  return (
+    <div className="pb-28">
+      <Header title="作業日報の確認" sub="原本と見くらべて登録" onBack={onCancel} />
+      <div className="px-4 pt-4 space-y-4">{fields}</div>
+      {footer}
+    </div>
+  );
+}
+
+/* ============================== 管理画面（PC・最小構成） ============================== */
+function Desktop({projects, docs, reports, agg, totals, createProject, resolveScan, saveDoc, saveReport, updateDoc, deleteDoc, onExport, flash, autoIngest, ingest, resetDemo, loadDemo, deleteBill}){
+  const empty = docs.length===0 && reports.length===0;
+  const [review,setReview] = useState(null);
+  const [picker,setPicker] = useState(false);
+  const [scanMsg,setScanMsg] = useState(null);
+  const fileRef = useRef(null);
+  const [drag,setDrag] = useState(false);
+  const uploadMain=()=>doScan(sampleShots.find(s=>s.id==="s9"));
+  const [view,setView] = useState("bill"); // bill | report
+  const [guide,setGuide] = useState(false);
+  const doScan=(shot)=>{ setPicker(false);
+    const rep=shot.result.kind==="report";
+    const msgs=rep?["📄 日報を読み取り中…","🏗 現場を名寄せ中…","✅ もうすぐ完了…"]:["📄 明細を読み取り中…","🏗 現場を名寄せ中…","✨ 新規案件を判定中…","✅ もうすぐ完了…"];
+    let i=0; setScanMsg(msgs[0]);
+    const iv=setInterval(()=>{ i++; if(i<msgs.length) setScanMsg(msgs[i]); }, 620);
+    setTimeout(()=>{ clearInterval(iv); setScanMsg(null); if(shot.result.fail){ flash("うまく読み取れませんでした。もう一度アップロードしてください"); } else if(rep){ setReview({...shot.result, _tint:shot.tint}); } else { setReview(resolveScan({...shot.result, _tint:shot.tint})); } }, rep?1900:2500); };
+  const doSave=(payload)=>{ if(review&&review._existing) deleteBill(review._existing); saveDoc(payload, null); setReview(null); };
+  const doSaveReport=(r)=>{ saveReport(r); setReview(null); };
+  const pname=(pid)=>(projects.find(p=>p.id===pid)||{}).name||"（未割当）";
+  const mdShort=(s)=>(+s.slice(5,7))+"/"+(+s.slice(8,10));
+  const repSorted = useMemo(()=>[...reports].sort((a,b)=>b.date.localeCompare(a.date)),[reports]);
+  const exRep=(kind)=>onExport({kind,title:"日報一覧",matrix:[["作業日","現場","天候","作業員","開始","終了","作業内容","使用資材"],...repSorted.map(r=>[r.date,pname(r.pid),(r.weather||"").replace(/[^晴曇雨雪]/g,""),(r.workers||[]).join("・"),r.start,r.end,r.work,r.materials||""])]});
+
+  const bills = useMemo(()=>{ const m={}; docs.forEach((d,i)=>{ const k=dupKey(d); if(!m[k]) m[k]={key:k,partner:d.partner,date:d.date,type:d.type,dir:d.dir,src:(d.src!=null?d.src:0),items:[],ord:i,sites:{}}; m[k].items.push(d); m[k].sites[d.pid]=1; }); return Object.values(m).map(b=>({...b,total:b.items.reduce((s,x)=>s+x.total,0),siteN:Object.keys(b.sites).length})).sort((a,b)=>b.date.localeCompare(a.date)||b.ord-a.ord); },[docs]);
+  const openBill=(b)=>setReview({ _existing:b.key, type:b.type, dir:b.dir, partner:b.partner, date:b.date, total:(b.src||b.total), items:b.items.map(x=>({name:x.memo,amount:x.total,pid:x.pid})), _tint:"from-orange-100 to-amber-50" });
+  const [q,setQ] = useState("");
+  const billsView = useMemo(()=>{ const kw=q.trim(); if(!kw)return bills; return bills.filter(b=>(b.partner||"").includes(kw)||b.items.some(x=>(x.memo||"").includes(kw))||Object.keys(b.sites).some(pid=>pname(pid).includes(kw))); },[bills,q]);
+  const flow = useMemo(()=>{ const g={}; docs.forEach(d=>{ g[d.date]=g[d.date]||{date:d.date,inc:0,out:0}; if(d.dir==="sales")g[d.date].inc+=d.total; else g[d.date].out+=d.total; }); return Object.values(g).sort((a,b)=>b.date.localeCompare(a.date)); },[docs]);
+  const gp = useMemo(()=>[...agg].sort((a,b)=>b.profit-a.profit),[agg]);
+
+  const exDocs=(kind)=>onExport({kind,title:"明細",matrix:[["発行日","品名・摘要","取引先","現場","区分","金額"],...billsView.flatMap(b=>b.items).map(d=>[d.date,d.memo||"",d.partner,pname(d.pid),(DIR[d.dir]||{}).label||"",d.total])]});
+  const exFlow=(kind)=>onExport({kind,title:"日次入出金",matrix:[["日付","入金","出金","差引"],...flow.map(f=>[f.date,f.inc,f.out,f.inc-f.out])]});
+  const exGp=(kind)=>onExport({kind,title:"案件別粗利",matrix:[["現場","売上","原価","粗利","粗利率%"],...gp.map(p=>[p.name,p.sales,p.cost,p.profit,p.rate])]});
+
+  const ExBtns=({on})=>(<button onClick={()=>on("csv")} className="tap text-[12px] font-black text-brand-600 px-3 py-1.5 rounded-lg border border-brand-200 hover:bg-brand-50">Excelへ ↓</button>);
+
+  return (
+    <div className="max-w-[1080px] mx-auto px-5 py-6">
+      <div className="text-center">
+        <h1 className="text-2xl font-black text-ink-900">現場そろばん</h1>
+        <p className="text-[13px] text-ink-500 mt-1">現場の紙を放り込むだけ。請求書も日報も、AIが読み取って現場ごとにまとめます。</p>
+      </div>
+
+      {/* アップロード（ドラッグ＆ドロップ / ファイル選択） */}
+      <div onClick={()=>fileRef.current&&fileRef.current.click()}
+        onDragOver={e=>{e.preventDefault();setDrag(true);}} onDragLeave={()=>setDrag(false)} onDrop={e=>{e.preventDefault();setDrag(false);uploadMain();}}
+        className={"cursor-pointer rounded-2xl border-2 border-dashed mt-5 py-10 text-center transition-colors "+(drag?"border-brand-500 bg-brand-50":"border-ink-300 bg-white hover:border-brand-400 hover:bg-brand-50/40")}>
+        <input ref={fileRef} type="file" accept="image/*,application/pdf" className="hidden" onChange={()=>uploadMain()} />
+        <div className="text-5xl">🧾</div>
+        <div className="font-black text-ink-800 text-[16px] mt-3">現場の紙（請求書・日報）をここにドラッグ＆ドロップ</div>
+        <div className="text-[12.5px] text-ink-500 mt-1">またはクリックしてファイルを選択（PDF・写真）</div>
+        <div className="inline-block mt-4 px-6 py-2.5 rounded-xl bg-brand-500 text-white font-black text-[14px] shadow-lg shadow-brand-200">⬆ ファイルを選択</div>
+      </div>
+      {ingest && (
+        <div className="card p-4 mt-4">
+          <div className="flex items-center gap-2 text-[13px] font-bold text-brand-700"><span className="inline-block w-4 h-4 border-2 border-brand-200 border-t-brand-500 rounded-full spin"></span>アップロード処理中… {ingest.n}/{ingest.total} 枚</div>
+          <div className="h-1.5 bg-ink-100 rounded-full mt-2 overflow-hidden"><div className="h-full bg-brand-500 transition-all" style={{width:Math.round(ingest.n/ingest.total*100)+"%"}}></div></div>
+        </div>
+      )}
+
+      {empty && (
+        <div className="max-w-[620px] mx-auto mt-6">
+          <div className="grid grid-cols-3 gap-3">
+            <div className="card p-4 text-center"><div className="text-xl font-black text-brand-500">①</div><div className="text-[12px] font-black text-ink-800 mt-1">放り込む</div><div className="text-[11px] text-ink-500 mt-0.5">請求書・日報をドラッグ</div></div>
+            <div className="card p-4 text-center"><div className="text-xl font-black text-brand-500">②</div><div className="text-[12px] font-black text-ink-800 mt-1">AIが読む</div><div className="text-[11px] text-ink-500 mt-0.5">明細を現場ごとに振り分け</div></div>
+            <div className="card p-4 text-center"><div className="text-xl font-black text-brand-500">③</div><div className="text-[12px] font-black text-ink-800 mt-1">利益が見える</div><div className="text-[11px] text-ink-500 mt-0.5">現場ごとの粗利を自動集計</div></div>
+          </div>
+          <p className="text-center text-[12px] text-ink-400 mt-4">上の枠に最初の1枚を放り込むと、ここに現場ごとの利益がまとまります。</p>
+          <div className="text-center mt-2"><button onClick={loadDemo} className="tap text-[12px] font-bold text-brand-600">サンプルデータで見てみる →</button></div>
+        </div>
+      )}
+
+      {!empty && (<>
+      {/* 表示切替：請求書 / 日報 */}
+      <div className="flex justify-center mt-5">
+        <div className="inline-flex bg-ink-100 rounded-full p-0.5 text-[13px] font-bold">
+          <button onClick={()=>setView("bill")} className={"tap px-6 py-1.5 rounded-full transition-colors "+(view==="bill"?"bg-white text-ink-900 shadow-sm":"text-ink-500")}>請求書</button>
+          <button onClick={()=>setView("report")} className={"tap px-6 py-1.5 rounded-full transition-colors "+(view==="report"?"bg-white text-ink-900 shadow-sm":"text-ink-500")}>日報</button>
+        </div>
+      </div>
+
+      {view==="bill" && (<>
+      {/* サマリー */}
+      <div className="grid grid-cols-3 gap-3 mt-4">
+        <div className="card p-3"><div className="text-[11px] text-ink-500 font-bold">売上</div><div className="text-xl font-black num">{yen(totals.sales)}</div></div>
+        <div className="card p-3"><div className="text-[11px] text-ink-500 font-bold">原価</div><div className="text-xl font-black num text-rose-600">{yen(totals.cost)}</div></div>
+        <div className="card p-3"><div className="text-[11px] text-ink-500 font-bold">粗利</div><div className="text-xl font-black num text-brand-700">{yen(totals.profit)}</div></div>
+      </div>
+
+      {/* 現場ごとの利益（答えを先に） */}
+      <div className="card p-5 mt-4">
+        <div className="flex items-center justify-between mb-3">
+          <span className="font-black text-ink-900">現場ごとの利益</span>
+          <ExBtns on={exGp} />
+        </div>
+        <div className="overflow-x-auto scroll-thin">
+          <table className="w-full text-[13px]">
+            <thead><tr className="text-ink-500 border-b border-ink-200">
+              <th className="text-left font-bold py-2 pr-2">現場</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">売上</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">原価</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">粗利</th>
+              <th className="text-right font-bold py-2 pl-2 whitespace-nowrap">粗利率</th>
+            </tr></thead>
+            <tbody>
+              {gp.map(p=>(
+                <tr key={p.id} className="border-b border-ink-100 hover:bg-ink-50">
+                  <td className="py-2.5 pr-2"><span className="font-bold text-ink-900">{p.name}</span>{p.auto && <span className="chip bg-brand-50 text-brand-700 border border-brand-200 ml-1.5">自動</span>}</td>
+                  <td className="py-2.5 px-2 text-right num text-ink-700 whitespace-nowrap">{yen(p.sales)}</td>
+                  <td className="py-2.5 px-2 text-right num text-rose-600 whitespace-nowrap">{yen(p.cost)}</td>
+                  <td className="py-2.5 px-2 text-right num font-black text-brand-700 whitespace-nowrap">{yen(p.profit)}</td>
+                  <td className={"py-2.5 pl-2 text-right num font-bold whitespace-nowrap "+(p.rate>=25?"text-emerald-600":p.rate>=10?"text-amber-600":"text-rose-600")}>{p.rate}%</td>
+                </tr>
+              ))}
+              {!gp.length && <tr><td colSpan="5" className="py-8 text-center text-ink-400">アップロードすると現場ごとの利益が集計されます</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+
+      {/* 取り込んだ請求書（書類）一覧 */}
+      <div className="card p-5 mt-4">
+        <div className="flex items-center justify-between mb-3 gap-3 flex-wrap">
+          <span className="font-black text-ink-900">取り込んだ請求書 <span className="text-ink-400 text-[12px] font-bold">{billsView.length}件</span></span>
+          <div className="flex items-center gap-2">
+            <input value={q} onChange={e=>setQ(e.target.value)} placeholder="取引先・品名・現場で検索" className="field py-1.5 text-[12px] w-52" />
+            <ExBtns on={exDocs} />
+          </div>
+        </div>
+        <div className="overflow-x-auto scroll-thin">
+          <table className="w-full text-[13px]">
+            <thead><tr className="text-ink-500 border-b border-ink-200">
+              <th className="text-left font-bold py-2 pr-2 whitespace-nowrap">発行日</th>
+              <th className="text-left font-bold py-2 px-2 whitespace-nowrap">種別</th>
+              <th className="text-left font-bold py-2 px-2">取引先</th>
+              <th className="text-left font-bold py-2 px-2">現場</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">明細</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">金額</th>
+              <th className="py-2 pl-2"></th>
+            </tr></thead>
+            <tbody>
+              {billsView.map(b=>(
+                <tr key={b.key} onClick={()=>openBill(b)} className="border-b border-ink-100 hover:bg-brand-50/50 cursor-pointer">
+                  <td className="py-2.5 pr-2 num text-ink-600 whitespace-nowrap">{mdShort(b.date)}</td>
+                  <td className="py-2.5 px-2 whitespace-nowrap">{(DOCTYPE[b.type]||{}).icon} <span className="text-ink-600 text-[12px]">{(DOCTYPE[b.type]||{}).label}</span></td>
+                  <td className="py-2.5 px-2 font-bold text-ink-900 truncate max-w-[200px]">{b.partner}</td>
+                  <td className="py-2.5 px-2 text-ink-600 truncate max-w-[160px]">{b.siteN>1?b.siteN+"現場":pname(b.items[0].pid)}</td>
+                  <td className="py-2.5 px-2 text-right num text-ink-500 whitespace-nowrap">{b.items.length}行</td>
+                  <td className={"py-2.5 px-2 text-right num font-bold whitespace-nowrap "+(b.dir==="cost"?"text-rose-600":"text-emerald-600")}>{b.dir==="cost"?"−":"+"}{yen(b.total)}</td>
+                  <td className="py-2.5 pl-2 text-right"><button onClick={(e)=>{e.stopPropagation();deleteBill(b.key);}} className="tap text-[12px] font-bold text-ink-400 hover:text-rose-600 whitespace-nowrap">削除</button></td>
+                </tr>
+              ))}
+              {!billsView.length && <tr><td colSpan="7" className="py-10 text-center text-ink-400">{q?"該当する請求書がありません":"請求書をアップロードすると、ここに一覧表示されます"}</td></tr>}
+            </tbody>
+          </table>
+        </div>
+        <div className="text-[11px] text-ink-400 mt-2">行をクリックすると、読み込んだときと同じ画面で明細を確認・修正できます。</div>
+      </div>
+
+      {/* 日ごとの入出金 */}
+      <div className="card p-5 mt-4">
+        <div className="flex items-center justify-between mb-3">
+          <span className="font-black text-ink-900">日ごとの入出金予定</span>
+          <ExBtns on={exFlow} />
+        </div>
+        <div className="overflow-x-auto scroll-thin">
+          <table className="w-full text-[13px]">
+            <thead><tr className="text-ink-500 border-b border-ink-200">
+              <th className="text-left font-bold py-2 whitespace-nowrap">日付</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">入金</th>
+              <th className="text-right font-bold py-2 px-2 whitespace-nowrap">出金</th>
+              <th className="text-right font-bold py-2 whitespace-nowrap">差引</th>
+            </tr></thead>
+            <tbody>
+              {flow.map(f=>{ const net=f.inc-f.out; return (
+                <tr key={f.date} className="border-b border-ink-100">
+                  <td className="py-2 num text-ink-700 whitespace-nowrap">{mdShort(f.date)}</td>
+                  <td className="py-2 px-2 text-right num text-emerald-600 whitespace-nowrap">{f.inc?yen(f.inc):"–"}</td>
+                  <td className="py-2 px-2 text-right num text-rose-600 whitespace-nowrap">{f.out?yen(f.out):"–"}</td>
+                  <td className={"py-2 text-right num font-bold whitespace-nowrap "+(net>=0?"text-ink-800":"text-rose-600")}>{yen(net)}</td>
+                </tr>
+              ); })}
+              {!flow.length && <tr><td colSpan="4" className="py-8 text-center text-ink-400">データがありません</td></tr>}
+            </tbody>
+          </table>
+        </div>
+      </div>
+      </>)}
+
+      {view==="report" && (
+        <div className="card p-5 mt-4">
+          <div className="flex items-center justify-between mb-3">
+            <span className="font-black text-ink-900">日報一覧 <span className="text-ink-400 text-[12px] font-bold">{repSorted.length}件</span></span>
+            <ExBtns on={exRep} />
+          </div>
+          <div className="overflow-x-auto scroll-thin">
+            <table className="w-full text-[13px]">
+              <thead><tr className="text-ink-500 border-b border-ink-200">
+                <th className="text-left font-bold py-2 pr-2 whitespace-nowrap">作業日</th>
+                <th className="text-left font-bold py-2 px-2 whitespace-nowrap">現場</th>
+                <th className="text-left font-bold py-2 px-2 whitespace-nowrap">天候</th>
+                <th className="text-left font-bold py-2 px-2 whitespace-nowrap">作業員</th>
+                <th className="text-left font-bold py-2 px-2 whitespace-nowrap">時間</th>
+                <th className="text-left font-bold py-2 px-2">作業内容</th>
+              </tr></thead>
+              <tbody>
+                {repSorted.map(r=>(
+                  <tr key={r.id} className="border-b border-ink-100 hover:bg-ink-50">
+                    <td className="py-2 pr-2 num text-ink-600 whitespace-nowrap">{mdShort(r.date)}</td>
+                    <td className="py-2 px-2 font-bold text-ink-900 truncate max-w-[160px]">{pname(r.pid)}</td>
+                    <td className="py-2 px-2 whitespace-nowrap">{r.weather}</td>
+                    <td className="py-2 px-2 text-ink-600 whitespace-nowrap">{(r.workers||[]).length}名</td>
+                    <td className="py-2 px-2 num text-ink-600 whitespace-nowrap">{r.start}–{r.end}</td>
+                    <td className="py-2 px-2 text-ink-700 truncate max-w-[260px]">{r.work}</td>
+                  </tr>
+                ))}
+                {!repSorted.length && <tr><td colSpan="6" className="py-10 text-center text-ink-400">紙の日報をアップロードすると、ここにまとまります</td></tr>}
+              </tbody>
+            </table>
+          </div>
+          <div className="gloss mt-3">紙の作業日報を放り込むだけ。AIが現場・作業員・作業内容を読み取り、ここにまとまります。CSV／Excelで書き出せます。</div>
+        </div>
+      )}
+      </>)}
+
+      {/* デモ用の操作（本番では非表示） */}
+      <div className="mt-8 pt-4 border-t border-ink-200 flex flex-wrap justify-center gap-5 text-[11px] text-ink-300">
+        <span className="font-bold">デモ用：</span>
+        <button onClick={()=>setPicker(true)} disabled={!!ingest} className="tap hover:text-ink-500 disabled:opacity-40">別のサンプルを選ぶ</button>
+        <button onClick={autoIngest} disabled={!!ingest} className="tap hover:text-ink-500 disabled:opacity-40">まとめて一括投入</button>
+        <button onClick={resetDemo} disabled={!!ingest} className="tap hover:text-ink-500 disabled:opacity-40">空にする（初回状態）</button>
+        <button onClick={loadDemo} disabled={!!ingest} className="tap hover:text-ink-500 disabled:opacity-40">サンプル読込</button>
+        <button onClick={()=>setGuide(true)} className="tap hover:text-ink-500">実装ガイド</button>
+      </div>
+      {guide && <Guide onClose={()=>setGuide(false)} />}
+
+      {/* アップロード選択（デモ） */}
+      {picker && (
+        <div className="fixed inset-0 z-50 bg-black/50 flex items-center justify-center p-6" onClick={()=>setPicker(false)}>
+          <div className="bg-white rounded-2xl p-5 w-full max-w-[420px]" onClick={e=>e.stopPropagation()}>
+            <div className="font-black text-ink-900 mb-1">請求書をアップロード</div>
+            <div className="text-[12px] text-ink-500 mb-3">デモ：ファイルの代わりにサンプルを選んでください</div>
+            <div className="grid grid-cols-4 gap-2">
+              {sampleShots.map(s=>(
+                <button key={s.id} onClick={()=>doScan(s)} className={"tap rounded-xl aspect-[3/4] bg-gradient-to-br "+s.tint+" border border-ink-200 flex flex-col items-center justify-center gap-1"}>
+                  <span className="text-2xl">{s.result.kind==="report"?"📝":(DOCTYPE[s.result.type]||{icon:"⚠️"}).icon}</span>
+                  <span className="text-[10px] font-bold text-ink-700 leading-tight text-center px-0.5">{s.face}</span>
+                </button>
+              ))}
+            </div>
+          </div>
+        </div>
+      )}
+      {scanMsg && (
+        <div className="fixed inset-0 z-50 bg-black/70 flex items-center justify-center">
+          <div className="bg-white rounded-2xl px-8 py-7 text-center w-[300px]">
+            <span className="inline-block w-8 h-8 border-[3px] border-brand-200 border-t-brand-500 rounded-full spin"></span>
+            <div className="font-black text-ink-900 text-[15px] mt-4">{scanMsg}</div>
+            <div className="text-[12px] text-ink-400 mt-1">AIが書類を処理しています</div>
+          </div>
+        </div>
+      )}
+
+      {/* アップロード確認（大画面：左=原本／右=明細） */}
+      {review && (
+        <div className="fixed inset-0 z-50 bg-black/60 flex items-center justify-center p-2">
+          <div className="bg-ink-50 rounded-2xl w-[98vw] h-[97vh] max-w-[1500px] overflow-hidden shadow-2xl flex flex-col">
+            {review.kind==="report"
+              ? <ReportReview wide data={review} projects={projects} onSave={doSaveReport} onCancel={()=>setReview(null)} onCreateProject={createProject} />
+              : <Review wide data={review} projects={projects} docs={docs} onSave={doSave} onCancel={()=>setReview(null)} onCreateProject={createProject} />}
+          </div>
+        </div>
+      )}
+
+    </div>
+  );
+}
+
+/* ============================== 現場アプリ（スマホ） ============================== */
+function MobileApp({projects, docs, pending, agg, totals, createProject, addPending, saveDoc, bulkConfirm, onExport, framed}){
+  const [tab,setTab] = useState("home");
+  const [openPid,setOpenPid] = useState(null);
+  const [review,setReview] = useState(null);
+  const [readFail,setReadFail] = useState(false);
+  const blankDoc={ type:"invoice", dir:"cost", partner:"", date:TODAY, total:0, items:[], pid_hint:"" };
+
+  const onScanned=(r,tint)=>{ if(r.fail){ setReadFail(true); } else { addPending(r,tint); } };
+  const doSave=(payload)=>{ const fromTray=review&&review._id!=null; saveDoc(payload, fromTray?review._id:null); setReview(null); setTab(fromTray?"capture":"home"); };
+
+  let screen;
+  if(readFail) screen = <ReadFailed onRetry={()=>{ setReadFail(false); setTab("capture"); }} onManual={()=>{ setReadFail(false); setReview(blankDoc); }} />;
+  else if(review) screen = <Review data={review} projects={projects} docs={docs} onSave={doSave} onCancel={()=>setReview(null)} onCreateProject={createProject} />;
+  else if(openPid) screen = <Project p={agg.find(p=>p.id===openPid)} docs={docs} onBack={()=>setOpenPid(null)} onExport={onExport} />;
+  else if(tab==="capture") screen = <Capture onScanned={onScanned} pending={pending} projects={projects} onOpen={(it)=>setReview(it)} onBulkConfirm={bulkConfirm} />;
+  else screen = <Home agg={agg} totals={totals} docs={docs} onOpen={setOpenPid} onExport={onExport} />;
+
+  const showNav = !review && !openPid && !readFail;
+  const navBar = showNav && (
+    <div className={(framed?"absolute":"fixed")+" bottom-0 inset-x-0 max-w-[430px] mx-auto bg-white border-t border-ink-200 flex z-40"}>
+      {[["home","案件"],["capture","スキャン"]].map(([id,label])=>(
+        <button key={id} onClick={()=>{setTab(id);setOpenPid(null);}} className={"relative flex-1 py-3.5 text-[13px] font-black "+(tab===id?"text-brand-600":"text-ink-400")}>
+          {tab===id && <span className="absolute top-0 left-1/2 -translate-x-1/2 w-10 h-0.5 bg-brand-500 rounded-full"></span>}
+          {label}
+          {id==="capture" && pending.length>0 && <span className="absolute top-2.5 right-[28%] min-w-4 h-4 px-1 rounded-full bg-rose-500 text-white text-[10px] font-black inline-flex items-center justify-center">{pending.length}</span>}
+        </button>
+      ))}
+    </div>
+  );
+  if(framed) return (
+    <div className="h-full flex flex-col relative bg-ink-50">
+      <div className="flex-1 overflow-y-auto scroll-thin">{screen}</div>
+      {navBar}
+    </div>
+  );
+  return (
+    <div className="w-full max-w-[430px] bg-ink-50 min-h-screen relative shadow-2xl">
+      {screen}
+      {navBar}
+    </div>
+  );
+}
+
+/* ============================== ルート（デバイス出し分け＋共有状態） ============================== */
+function Root(){
+  const [projects,setProjects] = useState(seedProjects);
+  const [docs,setDocs] = useState(seedDocs);
+  const [reports,setReports] = useState(seedReports);
+  const [pending,setPending] = useState([]);
+  const [toast,setToast] = useState("");
+  const [exp,setExp] = useState(null);
+  const [device,setDevice] = useState("pc"); // pc | field
+  const [ingest,setIngest] = useState(null); // {n,total}
+  const idRef = useRef(1);
+  const genId = ()=> idRef.current++;
+  const flash = (m)=>{ setToast(m); setTimeout(()=>setToast(""),2200); };
+
+  const agg = useAgg(projects, docs);
+  const totals = useMemo(()=>{
+    const t={sales:0,cost:0}; agg.forEach(p=>{t.sales+=p.sales;t.cost+=p.cost});
+    t.profit=t.sales-t.cost; t.rate=t.sales?Math.round(t.profit/t.sales*100):0; return t;
+  },[agg]);
+
+  const createProject=(name)=>{ const id="P_"+genId()+"_"+name.replace(/\s/g,"").slice(0,4); setProjects(ps=>[...ps,{ id, name, client:"（新規）", sales:0 }]); flash(`現場「${name}」を登録しました`); return id; };
+  const matchSite=(raw)=>{ const n=(raw||"").replace(/[\s　]/g,""); if(!n)return null; return projects.find(p=>{ const pn=(p.name||"").replace(/[\s　]/g,""); return pn && (pn.includes(n)||n.includes(pn)); }); };
+  // スキャン結果を解決：現場名を既存案件に名寄せ、無ければ自動登録、判別不能は要命名。感動ポイント。
+  const resolveScan=(result)=>{
+    const items0 = (result.items&&result.items.length) ? result.items : [{ name:"書類全体", amount:result.total, siteRaw: result.pid_hint?null:"" }];
+    const map={}, newProjs=[], matched=new Set(), created=new Set(); let need=0, unread=0;
+    const items = items0.map(it=>{
+      const amount = (it.unread||it.amount==null)?null:it.amount;
+      if(amount==null) unread++;
+      if(it.pid) return { name:it.name||"", amount, pid:it.pid, source:"ocr" };
+      const raw=(it.siteRaw||"").trim();
+      if(!raw){ need++; return { name:it.name||"", amount, pid:"", needName:true, source:"ocr" }; }
+      if(map[raw]) return { name:it.name||"", amount, pid:map[raw], source:"ocr" };
+      const hit=matchSite(raw);
+      if(hit){ map[raw]=hit.id; matched.add(hit.name); return { name:it.name||"", amount, pid:hit.id, source:"ocr" }; }
+      const id="AUTO_"+raw; map[raw]=id; created.add(raw); newProjs.push({ id, name:raw, client:"（スキャン自動作成）", sales:0, auto:true });
+      return { name:it.name||"", amount, pid:id, source:"ocr" };
+    });
+    if(newProjs.length) setProjects(ps=>{ const have=new Set(ps.map(p=>p.name)); return [...ps, ...newProjs.filter(np=>!have.has(np.name))]; });
+    return { ...result, items, _summary:{ lines:items.length, matched:matched.size, created:created.size, need, unread } };
+  };
+  const addPending=(r,tint)=>{ const rr=resolveScan(r); setPending(p=>[...p,{ ...rr, _id:genId(), _tint:tint }]); flash("トレイに追加しました"); };
+  const saveDoc=(payload,pendingId)=>{
+    const lines = (payload.lines&&payload.lines.length) ? payload.lines
+      : (payload.allocations||[]).map(a=>({ name:a.memo, amount:a.amount, pid:a.pid, site:(projects.find(p=>p.id===a.pid)||{}).name||"" }));
+    // 1行1品目で保存（明細を残す）。集計は pid で合算されるので粗利・入出金は不変
+    setDocs(d=>{ const out=[...d]; lines.forEach((l,i)=>out.push({ id:"D"+genId()+"_"+i, pid:l.pid, type:payload.type, dir:payload.dir, partner:payload.partner, date:payload.date, total:l.amount, src:payload.total, memo:l.name||"" })); return out; });
+    if(pendingId!=null) setPending(p=>p.filter(x=>x._id!==pendingId));
+    // 登録した瞬間、明細をクリップボードへ（Excelにそのまま貼付）
+    try{
+      const tsv = [["発行日","取引先","品名・摘要","金額(税込)","工事名"], ...lines.map(l=>[payload.date, payload.partner, l.name||"", l.amount==null?"":l.amount, l.site||(projects.find(p=>p.id===l.pid)||{}).name||""])].map(r=>r.join("\t")).join("\n");
+      if(navigator.clipboard) navigator.clipboard.writeText(tsv);
+    }catch(e){}
+    flash("登録しました。Excelに貼り付けできます（コピー済）✓");
+  };
+  const bulkConfirm=()=>{
+    const ready = pending.filter(isReady); if(!ready.length) return;
+    let saved=0, skipped=0;
+    setDocs(d=>{ const out=[...d]; ready.forEach(r=>{
+      if(out.some(x=>dupKey(x)===dupKey({partner:r.partner,date:r.date,src:r.total}))){ skipped++; return; }
+      const lines=(r.items&&r.items.length)?r.items:[{name:r.partner,amount:r.total,pid:r.pid_hint}];
+      lines.forEach((l,i)=>out.push({ id:"D"+genId()+"_b"+i, pid:l.pid, type:r.type, dir:r.dir, partner:r.partner, date:r.date, total:l.amount, src:r.total, memo:l.name||"" }));
+      saved++;
+    }); return out; });
+    const ids=new Set(ready.map(r=>r._id)); setPending(p=>p.filter(x=>!ids.has(x._id)));
+    flash(`${saved}件を保存${skipped?`（重複${skipped}件はスキップ）`:""} ✓`);
+  };
+  const saveReport=(f)=>{ if(f.id){ setReports(rs=>rs.map(r=>r.id===f.id?f:r)); } else { setReports(rs=>[...rs,{ ...f, id:"R"+genId()+"_"+f.date }]); } flash("日報を保存しました ✓"); };
+  const updateDoc=(id,patch)=>{ setDocs(ds=>ds.map(d=>d.id===id?{...d,...patch}:d)); flash("修正しました ✓"); };
+  const deleteDoc=(id)=>{ setDocs(ds=>ds.filter(d=>d.id!==id)); flash("削除しました"); };
+  const deleteBill=(key)=>{ setDocs(ds=>ds.filter(d=>dupKey(d)!==key)); };
+  const resetDemo=()=>{ setProjects([]); setDocs([]); setReports([]); setPending([]); flash("空にしました。最初の1枚をどうぞ"); };
+  const loadDemo=()=>{ setProjects(seedProjects); setDocs(seedDocs); setReports(seedReports); flash("サンプルを読み込みました"); };
+
+  const autoIngest=()=>{
+    if(ingest) return;
+    setDocs(ds=>ds.filter(d=>!String(d.id).startsWith("AD_")));
+    setProjects(ps=>ps.filter(p=>!p.auto));
+    setIngest({n:0,total:demoBatch.length});
+    const step=(i)=>{
+      if(i>=demoBatch.length){ setIngest(null); flash("スキャン完了：案件マスタ・原価・支払いを自動作成 ✓"); return; }
+      const inv=demoBatch[i];
+      setProjects(ps=>{ const have=new Set(ps.map(p=>p.name)); const add=[]; inv.lines.forEach(l=>{ if(!have.has(l.site)){ have.add(l.site); add.push({ id:"AUTO_"+l.site, name:l.site, client:"（スキャン自動作成）", sales:0, auto:true }); } }); return add.length?[...ps,...add]:ps; });
+      const total=inv.lines.reduce((s,l)=>s+l.amount,0);
+      setDocs(ds=>[...ds, ...inv.lines.map((l,j)=>({ id:"AD_"+i+"_"+j, pid:"AUTO_"+l.site, type:inv.type, dir:inv.dir, partner:inv.partner, date:inv.date, total:l.amount, src:total, memo:l.name }))]);
+      setIngest({n:i+1,total:demoBatch.length});
+      setTimeout(()=>step(i+1), 650);
+    };
+    setTimeout(()=>step(0), 250);
+  };
+
+  const shared={ projects, docs, reports, pending, agg, totals, createProject, addPending, resolveScan, saveDoc, updateDoc, deleteDoc, bulkConfirm, saveReport, onExport:setExp, flash, resetDemo, loadDemo, deleteBill };
+
+  return (
+    <div className="min-h-screen bg-ink-200">
+      <div className="sticky top-0 z-[60] bg-ink-50/90 backdrop-blur border-b border-ink-200 flex items-center justify-center py-2 px-3">
+        <div className="inline-flex bg-ink-100 rounded-full p-0.5 text-[12px] font-bold">
+          <button onClick={()=>setDevice("pc")} className={"tap px-4 py-1 rounded-full transition-colors "+(device==="pc"?"bg-white text-ink-900 shadow-sm":"text-ink-500")}>事務所</button>
+          <button onClick={()=>setDevice("field")} className={"tap px-4 py-1 rounded-full transition-colors "+(device==="field"?"bg-white text-ink-900 shadow-sm":"text-ink-500")}>現場</button>
+        </div>
+      </div>
+      {device==="pc"
+        ? <Desktop {...shared} autoIngest={autoIngest} ingest={ingest} />
+        : (
+          <div className="flex flex-col items-center py-8 gap-3">
+            <div className="relative w-[400px] max-w-[94vw] rounded-[2.75rem] bg-ink-900 p-3 shadow-2xl">
+              <div className="absolute top-3 left-1/2 -translate-x-1/2 w-32 h-6 bg-ink-900 rounded-b-2xl z-[55]"></div>
+              <div className="relative w-full rounded-[2.1rem] overflow-hidden bg-ink-50" style={{height:"min(800px,82vh)"}}>
+                <MobileApp framed {...shared} />
+              </div>
+            </div>
+            <p className="text-[12px] text-ink-500 font-bold">現場のスマホ画面 — 事務所と同じ数字がそのまま見えます</p>
+          </div>
+        )}
+      {exp && <ExportModal exp={exp} onClose={()=>setExp(null)} onCopied={flash} />}
+      <Toast msg={toast} />
+    </div>
+  );
+}
+
+ReactDOM.createRoot(document.getElementById("root")).render(<Root/>);
+</script>
+</body>
+</html>
