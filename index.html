@@ -1243,11 +1243,16 @@ function Desktop({projects, docs, reports, agg, totals, createProject, resolveSc
   const openBill=(b)=>setReview({ _existing:b.key, type:b.type, dir:b.dir, partner:b.partner, date:b.date, total:(b.src||b.total), items:b.items.map(x=>({name:x.memo,amount:x.total,pid:x.pid})), _tint:"from-orange-100 to-amber-50" });
   const [q,setQ] = useState("");
   const billsView = useMemo(()=>{ const kw=q.trim(); if(!kw)return bills; return bills.filter(b=>(b.partner||"").includes(kw)||b.items.some(x=>(x.memo||"").includes(kw))||Object.keys(b.sites).some(pid=>pname(pid).includes(kw))); },[bills,q]);
-  const flow = useMemo(()=>{ const g={}; docs.forEach(d=>{ g[d.date]=g[d.date]||{date:d.date,inc:0,out:0}; if(d.dir==="sales")g[d.date].inc+=d.total; else g[d.date].out+=d.total; }); return Object.values(g).sort((a,b)=>b.date.localeCompare(a.date)); },[docs]);
+  const months = useMemo(()=>{ const s={}; docs.forEach(d=>s[(d.date||"").slice(0,7)]=1); return Object.keys(s).filter(Boolean).sort().reverse(); },[docs]);
+  const [mi,setMi] = useState(0);
+  const month = months.length ? months[Math.min(mi,months.length-1)] : "";
+  const monthLbl = month ? month.slice(0,4)+"年"+(+month.slice(5,7))+"月" : "";
+  const flow = useMemo(()=>{ const g={}; docs.forEach(d=>{ if(month && (d.date||"").slice(0,7)!==month) return; g[d.date]=g[d.date]||{date:d.date,inc:0,out:0}; if(d.dir==="sales")g[d.date].inc+=d.total; else g[d.date].out+=d.total; }); return Object.values(g).sort((a,b)=>b.date.localeCompare(a.date)); },[docs,month]);
+  const flowTotal = flow.reduce((t,f)=>({inc:t.inc+f.inc,out:t.out+f.out}),{inc:0,out:0});
   const gp = useMemo(()=>[...agg].sort((a,b)=>b.profit-a.profit),[agg]);
 
   const exDocs=(kind)=>onExport({kind,title:"明細",matrix:[["発行日","品名・摘要","取引先","現場","区分","金額"],...billsView.flatMap(b=>b.items).map(d=>[d.date,d.memo||"",d.partner,pname(d.pid),(DIR[d.dir]||{}).label||"",d.total])]});
-  const exFlow=(kind)=>onExport({kind,title:"日次入出金",matrix:[["日付","入金","出金","差引"],...flow.map(f=>[f.date,f.inc,f.out,f.inc-f.out])]});
+  const exFlow=(kind)=>onExport({kind,title:monthLbl+" 入出金",matrix:[["日付","入金","出金","差引"],...flow.map(f=>[f.date,f.inc,f.out,f.inc-f.out]),["合計",flowTotal.inc,flowTotal.out,flowTotal.inc-flowTotal.out]]});
   const exGp=(kind)=>onExport({kind,title:"案件別粗利",matrix:[["現場","売上","原価","粗利","粗利率%"],...gp.map(p=>[p.name,p.sales,p.cost,p.profit,p.rate])]});
 
   const ExBtns=({on})=>(<button onClick={()=>on("csv")} className="tap text-[12px] font-black text-brand-600 px-3 py-1.5 rounded-lg border border-brand-200 hover:bg-brand-50">Excelへ ↓</button>);
@@ -1375,10 +1380,19 @@ function Desktop({projects, docs, reports, agg, totals, createProject, resolveSc
         <div className="text-[11px] text-ink-400 mt-2">行をクリックすると、読み込んだときと同じ画面で明細を確認・修正できます。</div>
       </div>
 
-      {/* 日ごとの入出金 */}
+      {/* 日ごとの入出金（月別） */}
       <div className="card p-5 mt-4">
-        <div className="flex items-center justify-between mb-3">
-          <span className="font-black text-ink-900">日ごとの入出金予定</span>
+        <div className="flex items-center justify-between mb-3 gap-2 flex-wrap">
+          <div className="flex items-center gap-2">
+            <span className="font-black text-ink-900">日ごとの入出金予定</span>
+            {months.length>0 && (
+              <span className="inline-flex items-center gap-1 text-[13px]">
+                <button onClick={()=>setMi(i=>Math.min(months.length-1,i+1))} disabled={mi>=months.length-1} className="tap w-7 h-7 rounded-lg hover:bg-ink-100 text-ink-600 disabled:opacity-30">‹</button>
+                <span className="font-black text-ink-800 min-w-[88px] text-center">{monthLbl}</span>
+                <button onClick={()=>setMi(i=>Math.max(0,i-1))} disabled={mi<=0} className="tap w-7 h-7 rounded-lg hover:bg-ink-100 text-ink-600 disabled:opacity-30">›</button>
+              </span>
+            )}
+          </div>
           <ExBtns on={exFlow} />
         </div>
         <div className="overflow-x-auto scroll-thin">
@@ -1398,8 +1412,9 @@ function Desktop({projects, docs, reports, agg, totals, createProject, resolveSc
                   <td className={"py-2 text-right num font-bold whitespace-nowrap "+(net>=0?"text-ink-800":"text-rose-600")}>{yen(net)}</td>
                 </tr>
               ); })}
-              {!flow.length && <tr><td colSpan="4" className="py-8 text-center text-ink-400">データがありません</td></tr>}
+              {!flow.length && <tr><td colSpan="4" className="py-8 text-center text-ink-400">この月のデータはありません</td></tr>}
             </tbody>
+            {flow.length>0 && <tfoot><tr className="border-t-2 border-ink-200 bg-ink-50 font-black"><td className="py-2">合計</td><td className="py-2 px-2 text-right num text-emerald-600">{flowTotal.inc?yen(flowTotal.inc):"–"}</td><td className="py-2 px-2 text-right num text-rose-600">{flowTotal.out?yen(flowTotal.out):"–"}</td><td className={"py-2 text-right num "+((flowTotal.inc-flowTotal.out)>=0?"text-ink-900":"text-rose-600")}>{yen(flowTotal.inc-flowTotal.out)}</td></tr></tfoot>}
           </table>
         </div>
       </div>

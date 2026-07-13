@@ -38,6 +38,24 @@
 本番は Bubble もしくは Web アプリで実装予定。詳細はアプリ内「実装ガイド」（PC画面下部）に同梱：
 データ設計（Document は現場を持たず明細行 Item に現場・実額積み上げ）／OCR仕様（請求書・日報の2種JSON＋bbox）／名寄せ・自動登録ロジック／集計・出力／権限（APIキーはBackendに隠蔽）。
 
-## ビルド
+## ビルド（配布用HTMLの再生成）
 
-`index.html`（CDN参照のソース）を編集し、React/ReactDOM・コンパイル済みアプリ・Tailwind静的CSSをインライン化して `genba-ocr-mock-standalone.html`／`artifact.html` を生成します。
+`index.html`（CDN参照の編集用ソース）を直したら、以下で配布用の自己完結HTMLを再生成します。
+React/ReactDOM・コンパイル済みアプリ・使用ぶんのTailwind静的CSSをすべてインライン化します。
+
+```bash
+cd build
+npm install      # 初回のみ（react / react-dom / @babel / tailwindcss）
+npm run build
+```
+
+生成物（すべて外部依存ゼロ）：
+- `genba-ocr-mock-standalone.html` … 配布・デモ用
+- `docs/index.html` … GitHub Pages 公開用（standaloneと同一）
+- `artifact.html` … claude.ai Artifact 公開用（doctype/head/body なしの断片）
+
+ビルド構成は `build/`（`build.js` / `tailwind.config.js` / `tailwind.css` / `package.json`）。
+`build/node_modules` と `build/tw.out.css` は生成物のため gitignore 済み。
+
+### 公開URL
+- GitHub Pages: https://asai-web.github.io/genba-ocr-mock/ （`docs/` を更新→push で自動反映）
