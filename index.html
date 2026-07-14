@@ -89,7 +89,8 @@ const isReady = (r)=>{
   return allAssigned && allRead && sum===r.total;
 };
 /* 重複判定キー（取引先＋日付＋原本合計） */
-const dupKey = (d)=> (d.partner||"").trim()+"|"+d.date+"|"+(d.src!=null?d.src:d.total);
+/* 重複/書類グルーピングのキー。書類番号があれば「取引先＋番号」で一意（強）、無ければ「取引先＋日付＋原本合計」（弱） */
+const dupKey = (d)=>{ const p=(d.partner||"").trim(); return (d.no||d.doc_no) ? p+"|#"+(d.no||d.doc_no) : p+"|"+d.date+"|"+(d.src!=null?d.src:d.total); };
 
 /* ============================== サンプルデータ ============================== */
 const seedProjects = [
@@ -503,7 +504,7 @@ function Review({data, projects, docs, onSave, onCancel, onCreateProject, wide})
     return Object.values(g).sort((a,b)=>(a.pid?1:0)-(b.pid?1:0));
   },[items]);
   const alloc = groups.filter(gp=>gp.pid).map(gp=>({ pid:gp.pid, amount:gp.sum, memo:(gp.rows.find(r=>r.name)||{}).name||"" }));
-  const dup = !data._existing && origTotal>0 && (docs||[]).some(d=> dupKey(d)===((partner||"").trim()+"|"+date+"|"+origTotal));
+  const dup = !data._existing && (partner.trim()||origTotal>0) && (docs||[]).some(d=> dupKey(d)===dupKey({ partner, no:data.no, date, src:origTotal }));
   const commitNewSite=(idx)=>{ const nm=((items[idx]||{})._name||"").trim(); if(!nm)return; const id=onCreateProject(nm); setItem(idx,{pid:id,_naming:false,_name:""}); };
   const onSiteChange=(idx,val)=>{ if(val==="__new__") setItem(idx,{_naming:true,pid:""}); else setItem(idx,{pid:val,_naming:false}); };
 
@@ -716,7 +717,7 @@ function Review({data, projects, docs, onSave, onCancel, onCreateProject, wide})
       </div>
       <div className="flex gap-3">
         <button onClick={onCancel} className="tap px-5 py-3 rounded-xl font-bold text-ink-600 bg-ink-100">やめる</button>
-        <button disabled={!canSave} onClick={()=>onSave({ type, dir, partner, date, total:origTotal||sum, allocations:alloc, lines: items.map(it=>({ name:it.name, amount:it.amount, pid:it.pid, site:pname(it.pid) })) })}
+        <button disabled={!canSave} onClick={()=>onSave({ type, dir, partner, date, no:data.no, total:origTotal||sum, allocations:alloc, lines: items.map(it=>({ name:it.name, amount:it.amount, pid:it.pid, site:pname(it.pid) })) })}
           className={"tap flex-1 py-3 rounded-xl font-black text-white shadow-lg "+(canSave?(dup?"bg-rose-500 shadow-rose-200":"bg-brand-500 shadow-brand-200"):"bg-ink-300 shadow-none")}>
           {!canSave ? "未入力があります" : dup ? "重複の可能性・登録" : data._existing ? "更新する" : "登録する"}
         </button>
@@ -1239,8 +1240,8 @@ function Desktop({projects, docs, reports, agg, totals, createProject, resolveSc
   const repSorted = useMemo(()=>[...reports].sort((a,b)=>b.date.localeCompare(a.date)),[reports]);
   const exRep=(kind)=>onExport({kind,title:"日報一覧",matrix:[["作業日","現場","天候","作業員","開始","終了","作業内容","使用資材"],...repSorted.map(r=>[r.date,pname(r.pid),(r.weather||"").replace(/[^晴曇雨雪]/g,""),(r.workers||[]).join("・"),r.start,r.end,r.work,r.materials||""])]});
 
-  const bills = useMemo(()=>{ const m={}; docs.forEach((d,i)=>{ const k=dupKey(d); if(!m[k]) m[k]={key:k,partner:d.partner,date:d.date,type:d.type,dir:d.dir,src:(d.src!=null?d.src:0),items:[],ord:i,sites:{}}; m[k].items.push(d); m[k].sites[d.pid]=1; }); return Object.values(m).map(b=>({...b,total:b.items.reduce((s,x)=>s+x.total,0),siteN:Object.keys(b.sites).length})).sort((a,b)=>b.date.localeCompare(a.date)||b.ord-a.ord); },[docs]);
-  const openBill=(b)=>setReview({ _existing:b.key, type:b.type, dir:b.dir, partner:b.partner, date:b.date, total:(b.src||b.total), items:b.items.map(x=>({name:x.memo,amount:x.total,pid:x.pid})), _tint:"from-orange-100 to-amber-50" });
+  const bills = useMemo(()=>{ const m={}; docs.forEach((d,i)=>{ const k=dupKey(d); if(!m[k]) m[k]={key:k,partner:d.partner,date:d.date,type:d.type,dir:d.dir,no:d.no||d.doc_no||"",src:(d.src!=null?d.src:0),items:[],ord:i,sites:{}}; m[k].items.push(d); m[k].sites[d.pid]=1; }); return Object.values(m).map(b=>({...b,total:b.items.reduce((s,x)=>s+x.total,0),siteN:Object.keys(b.sites).length})).sort((a,b)=>b.date.localeCompare(a.date)||b.ord-a.ord); },[docs]);
+  const openBill=(b)=>setReview({ _existing:b.key, type:b.type, dir:b.dir, partner:b.partner, date:b.date, no:b.no, total:(b.src||b.total), items:b.items.map(x=>({name:x.memo,amount:x.total,pid:x.pid})), _tint:"from-orange-100 to-amber-50" });
   const [q,setQ] = useState("");
   const billsView = useMemo(()=>{ const kw=q.trim(); if(!kw)return bills; return bills.filter(b=>(b.partner||"").includes(kw)||b.items.some(x=>(x.memo||"").includes(kw))||Object.keys(b.sites).some(pid=>pname(pid).includes(kw))); },[bills,q]);
   const months = useMemo(()=>{ const s={}; docs.forEach(d=>s[(d.date||"").slice(0,7)]=1); return Object.keys(s).filter(Boolean).sort().reverse(); },[docs]);
@@ -1599,14 +1600,9 @@ function Root(){
     const lines = (payload.lines&&payload.lines.length) ? payload.lines
       : (payload.allocations||[]).map(a=>({ name:a.memo, amount:a.amount, pid:a.pid, site:(projects.find(p=>p.id===a.pid)||{}).name||"" }));
     // 1行1品目で保存（明細を残す）。集計は pid で合算されるので粗利・入出金は不変
-    setDocs(d=>{ const out=[...d]; lines.forEach((l,i)=>out.push({ id:"D"+genId()+"_"+i, pid:l.pid, type:payload.type, dir:payload.dir, partner:payload.partner, date:payload.date, total:l.amount, src:payload.total, memo:l.name||"" })); return out; });
+    setDocs(d=>{ const out=[...d]; lines.forEach((l,i)=>out.push({ id:"D"+genId()+"_"+i, pid:l.pid, type:payload.type, dir:payload.dir, partner:payload.partner, date:payload.date, total:l.amount, src:payload.total, no:payload.no||"", memo:l.name||"" })); return out; });
     if(pendingId!=null) setPending(p=>p.filter(x=>x._id!==pendingId));
-    // 登録した瞬間、明細をクリップボードへ（Excelにそのまま貼付）
-    try{
-      const tsv = [["発行日","取引先","品名・摘要","金額(税込)","工事名"], ...lines.map(l=>[payload.date, payload.partner, l.name||"", l.amount==null?"":l.amount, l.site||(projects.find(p=>p.id===l.pid)||{}).name||""])].map(r=>r.join("\t")).join("\n");
-      if(navigator.clipboard) navigator.clipboard.writeText(tsv);
-    }catch(e){}
-    flash("登録しました。Excelに貼り付けできます（コピー済）✓");
+    flash("登録しました ✓（一覧の「Excelへ」でいつでも書き出せます）");
   };
   const bulkConfirm=()=>{
     const ready = pending.filter(isReady); if(!ready.length) return;
@@ -1614,7 +1610,7 @@ function Root(){
     setDocs(d=>{ const out=[...d]; ready.forEach(r=>{
       if(out.some(x=>dupKey(x)===dupKey({partner:r.partner,date:r.date,src:r.total}))){ skipped++; return; }
       const lines=(r.items&&r.items.length)?r.items:[{name:r.partner,amount:r.total,pid:r.pid_hint}];
-      lines.forEach((l,i)=>out.push({ id:"D"+genId()+"_b"+i, pid:l.pid, type:r.type, dir:r.dir, partner:r.partner, date:r.date, total:l.amount, src:r.total, memo:l.name||"" }));
+      lines.forEach((l,i)=>out.push({ id:"D"+genId()+"_b"+i, pid:l.pid, type:r.type, dir:r.dir, partner:r.partner, date:r.date, total:l.amount, src:r.total, no:r.no||"", memo:l.name||"" }));
       saved++;
     }); return out; });
     const ids=new Set(ready.map(r=>r._id)); setPending(p=>p.filter(x=>!ids.has(x._id)));

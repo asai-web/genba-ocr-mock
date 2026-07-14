@@ -417,7 +417,11 @@ const isReady = r => {
   return allAssigned && allRead && sum === r.total;
 };
 /* 重複判定キー（取引先＋日付＋原本合計） */
-const dupKey = d => (d.partner || "").trim() + "|" + d.date + "|" + (d.src != null ? d.src : d.total);
+/* 重複/書類グルーピングのキー。書類番号があれば「取引先＋番号」で一意（強）、無ければ「取引先＋日付＋原本合計」（弱） */
+const dupKey = d => {
+  const p = (d.partner || "").trim();
+  return d.no || d.doc_no ? p + "|#" + (d.no || d.doc_no) : p + "|" + d.date + "|" + (d.src != null ? d.src : d.total);
+};
 
 /* ============================== サンプルデータ ============================== */
 const seedProjects = [{
@@ -1369,7 +1373,12 @@ function Review({
     amount: gp.sum,
     memo: (gp.rows.find(r => r.name) || {}).name || ""
   }));
-  const dup = !data._existing && origTotal > 0 && (docs || []).some(d => dupKey(d) === (partner || "").trim() + "|" + date + "|" + origTotal);
+  const dup = !data._existing && (partner.trim() || origTotal > 0) && (docs || []).some(d => dupKey(d) === dupKey({
+    partner,
+    no: data.no,
+    date,
+    src: origTotal
+  }));
   const commitNewSite = idx => {
     const nm = ((items[idx] || {})._name || "").trim();
     if (!nm) return;
@@ -1739,6 +1748,7 @@ function Review({
       dir,
       partner,
       date,
+      no: data.no,
       total: origTotal || sum,
       allocations: alloc,
       lines: items.map(it => ({
@@ -2645,6 +2655,7 @@ function Desktop({
         date: d.date,
         type: d.type,
         dir: d.dir,
+        no: d.no || d.doc_no || "",
         src: d.src != null ? d.src : 0,
         items: [],
         ord: i,
@@ -2665,6 +2676,7 @@ function Desktop({
     dir: b.dir,
     partner: b.partner,
     date: b.date,
+    no: b.no,
     total: b.src || b.total,
     items: b.items.map(x => ({
       name: x.memo,
@@ -3404,17 +3416,13 @@ function Root() {
         date: payload.date,
         total: l.amount,
         src: payload.total,
+        no: payload.no || "",
         memo: l.name || ""
       }));
       return out;
     });
     if (pendingId != null) setPending(p => p.filter(x => x._id !== pendingId));
-    // 登録した瞬間、明細をクリップボードへ（Excelにそのまま貼付）
-    try {
-      const tsv = [["発行日", "取引先", "品名・摘要", "金額(税込)", "工事名"], ...lines.map(l => [payload.date, payload.partner, l.name || "", l.amount == null ? "" : l.amount, l.site || (projects.find(p => p.id === l.pid) || {}).name || ""])].map(r => r.join("\t")).join("\n");
-      if (navigator.clipboard) navigator.clipboard.writeText(tsv);
-    } catch (e) {}
-    flash("登録しました。Excelに貼り付けできます（コピー済）✓");
+    flash("登録しました ✓（一覧の「Excelへ」でいつでも書き出せます）");
   };
   const bulkConfirm = () => {
     const ready = pending.filter(isReady);
@@ -3446,6 +3454,7 @@ function Root() {
           date: r.date,
           total: l.amount,
           src: r.total,
+          no: r.no || "",
           memo: l.name || ""
         }));
         saved++;
